@@ -1,0 +1,153 @@
+# Release-Build: getriggert vom Push eines Tags `v*` (z.B. `v0.2.0`).
+# Baut parallel auf Windows / macOS (Universal-Binary) / Linux und legt
+# alle Artefakte als DRAFT-Release auf GitHub ab. Du gehst danach
+# manuell auf Releases → Edit → Publish, sobald Du die MSI/DMG/AppImage
+# selbst gegen-getestet hast.
+#
+# Workflow-Schritt-für-Schritt:
+#   1. Code auschecken
+#   2. Plattform-spezifische Build-Tools installieren
+#      (Strawberry Perl auf Windows wegen bundled-sqlcipher;
+#       webkit2gtk-4.1 + GTK auf Ubuntu für Tauri 2;
+#       Universal-Binary-Targets auf macOS für aarch64+x86_64)
+#   3. Node + Cargo cachen
+#   4. `tauri-action` ruft intern `pnpm tauri build` (oder npm) und
+#      lädt MSI/NSIS/DMG/DEB/AppImage als Release-Asset hoch.
+#
+# Code-Signing fehlt absichtlich erstmal — kein Apple-Developer-Cert,
+# kein Authenticode-Cert. Nutzer müssen beim ersten Start die SmartScreen-
+# / Gatekeeper-Warnung wegklicken. Sobald ein Cert da ist, kommen die
+# entsprechenden Secrets (`APPLE_*`, `WINDOWS_*`) in die Repo-Settings.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  # Manueller Trigger fürs Testen, bevor man einen echten Tag setzt.
+  # Wenn ohne Tag-Push gestartet, fällt `tauri-action` auf einen
+  # generierten Release-Namen ohne Versions-Tag zurück.
+  workflow_dispatch:
+
+# Aufeinanderfolgende Tag-Pushes desselben Tags abbrechen, damit
+# nicht zwei Workflows gleichzeitig dieselbe Release befüllen.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (${{ matrix.platform }})
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS: Universal-Binary, deckt sowohl Apple Silicon als
+          # auch Intel ab. `macos-latest` ist aktuell aarch64 — der
+          # x86_64-Teil kommt aus dem Cross-Compile-Target.
+          - platform: macos-latest
+            args: "--target universal-apple-darwin"
+          # Linux: ubuntu-22.04 statt -latest gewählt damit das
+          # produzierte AppImage auf älteren Distros lauffähig
+          # bleibt (glibc 2.35 vs. 2.39 auf 24.04). Tauri 2 will
+          # webkit2gtk-4.1 — auf 22.04 als Backport-Paket verfügbar.
+          - platform: ubuntu-22.04
+            args: ""
+          - platform: windows-latest
+            args: ""
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      # Universal-macOS braucht beide Rust-Targets installiert; auf
+      # Linux/Windows reicht der Default-Toolchain.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri -> target"
+
+      # Linux-spezifische System-Pakete für Tauri 2.
+      # `libwebkit2gtk-4.1-dev`: WebView. Tauri 2 spec; auf 22.04 via
+      #   universe-Repo verfügbar.
+      # `libgtk-3-dev`, `librsvg2-dev`: GTK + SVG-Render fürs Tray-Icon
+      #   und allgemeines Window-Decorating.
+      # `libayatana-appindicator3-dev`: Tray-Icon API der modernen
+      #   GNOME/Ubuntu-Welt.
+      # `libxdo-dev`: Tauri-Plugin-Shell für `open in default app`.
+      # `libssl-dev`: schon installiert auf Runner, aber sicherheits-
+      #   halber explizit.
+      # `patchelf`: AppImage-Bundling, sonst scheitert der finale
+      #   bundle-Step lautlos.
+      - name: Install Linux build dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            patchelf
+
+      # `bundled-sqlcipher-vendored-openssl` (siehe Cargo.toml)
+      # kompiliert OpenSSL aus Source und braucht ein vollständiges
+      # Perl mit den klassischen Modulen. Strawberry Perl ist die
+      # offizielle Wahl auf Windows; das mitgelieferte Git-Perl
+      # reicht NICHT (fehlende `Locale::Maketext::Simple`-Familie).
+      # `choco`-Installation macht ~1 Min, ist aber stabil über die
+      # Runner-Versionen.
+      - name: Install Strawberry Perl (Windows only)
+        if: matrix.platform == 'windows-latest'
+        run: choco install -y strawberryperl --no-progress
+        shell: pwsh
+
+      - name: Install Node deps
+        run: npm ci
+
+      # Der eigentliche Bundle-Build + Release-Upload.
+      # `tauri-action` ruft intern `npm run tauri build` und lädt
+      # alle Artefakte aus `src-tauri/target/release/bundle/` hoch.
+      # `releaseDraft: true` heißt: Release entsteht als Draft —
+      # Du kontrollierst manuell, was tatsächlich live geht.
+      # `prerelease: false` und stabile Tag-Form sind Default; bei
+      # Bedarf später per Tag-Suffix `-rc1` markierbar.
+      - name: Build Tauri bundle + upload to GitHub Release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "CrystalMail ${{ github.ref_name }}"
+          releaseBody: |
+            CrystalMail Release ${{ github.ref_name }}.
+
+            **Downloads:**
+            - **Windows**: `CrystalMail_*_x64-setup.exe` (NSIS) oder `CrystalMail_*_x64_en-US.msi` (MSI)
+            - **macOS**: `CrystalMail_*_universal.dmg` (Apple Silicon + Intel)
+            - **Linux**: `crystalmail_*_amd64.deb` (Debian/Ubuntu) oder `crystalmail_*_amd64.AppImage` (alle Distros)
+
+            ⚠️ Die Builds sind **nicht code-signiert** — beim ersten
+            Start zeigen Windows SmartScreen / macOS Gatekeeper eine
+            Warnung. Auf macOS einmalig Rechtsklick → „Öffnen", auf
+            Windows „Weitere Informationen" → „Trotzdem ausführen".
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
