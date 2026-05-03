@@ -11,11 +11,18 @@
 // disproportionate dependency cost for ~10 distinct bitmaps.
 //
 // `None` clears the overlay, which Windows collapses back to the base
-// icon. Non-Windows platforms noop the set_overlay_icon call — the
-// API is Windows-specific in Tauri 2.
+// icon. Non-Windows platforms (macOS, Linux) have no equivalent API
+// in Tauri 2 — `set_overlay_icon` ist nicht definiert; auf macOS
+// gäbe es zwar Dock-Badges, das ist aber ein anderer UX-Vertrag
+// (Zähler im roten Kreis am Dock-Icon, nicht klein über der
+// Taskbar-Vorschau). Wir lassen den Aufruf auf Nicht-Windows
+// schlicht ins Leere laufen, damit der Frontend-Caller nicht pro
+// Plattform branchen muss und der Build überall durchgeht.
 
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 
+/// Windows-Variante: tatsächlicher Overlay-Icon-Set via Tauri.
+#[cfg(target_os = "windows")]
 #[tauri::command]
 pub async fn set_unread_badge(
     app: AppHandle,
@@ -23,6 +30,8 @@ pub async fn set_unread_badge(
     width: u32,
     height: u32,
 ) -> Result<(), String> {
+    use tauri::Manager;
+
     let Some(window) = app.get_webview_window("main") else {
         // Main window not up yet during early startup — treat as a
         // successful no-op so the frontend's first-render invoke
@@ -50,4 +59,18 @@ pub async fn set_unread_badge(
     window
         .set_overlay_icon(icon)
         .map_err(|e| format!("set_overlay_icon: {e}"))
+}
+
+/// Non-Windows: silent no-op. Argumente kommen weiterhin im selben
+/// Shape vom Frontend rein (das spart die Plattform-Branch-Logik
+/// auf JS-Seite); wir verwerfen sie hier explizit.
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+pub async fn set_unread_badge(
+    _app: AppHandle,
+    _rgba: Option<Vec<u8>>,
+    _width: u32,
+    _height: u32,
+) -> Result<(), String> {
+    Ok(())
 }
