@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>CrystalMail</title>
+    <!--
+      Inline splash styling. Lives in <head> so the browser paints the
+      themed background before the main stylesheet is fetched — otherwise
+      the default white body shows through during the ~200 ms Vite cold
+      start. Tokens mirror the light/dark palette in src/index.css, so
+      the splash visually matches whatever the user's OS theme is.
+    -->
+    <style>
+      :root {
+        color-scheme: light dark;
+        --cm-splash-bg: oklch(0.985 0.002 250);
+        --cm-splash-panel: #ffffff;
+        --cm-splash-fg: oklch(0.18 0.015 250);
+        --cm-splash-muted: oklch(0.55 0.020 250);
+        --cm-splash-accent: oklch(0.54 0.16 235);
+        --cm-splash-ring: oklch(0.91 0.006 250);
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --cm-splash-bg: oklch(0.17 0.015 250);
+          --cm-splash-panel: oklch(0.20 0.018 250);
+          --cm-splash-fg: oklch(0.96 0.004 250);
+          --cm-splash-muted: oklch(0.68 0.012 250);
+          --cm-splash-accent: oklch(0.64 0.16 235);
+          --cm-splash-ring: oklch(0.24 0.018 250);
+        }
+      }
+      html,
+      body,
+      #root {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        background: var(--cm-splash-bg);
+        color: var(--cm-splash-fg);
+        font-family:
+          ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+          "Helvetica Neue", Arial, sans-serif;
+      }
+      /* Splash is pure CSS so it paints on the first frame, before React
+         has loaded a single byte of JS. */
+      .cm-splash {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 14px;
+        pointer-events: none;
+        /* Subtle upward entry so the screen doesn't feel static. */
+        animation: cm-splash-in 380ms ease-out both;
+      }
+      @keyframes cm-splash-in {
+        from { opacity: 0; transform: translateY(6px); }
+        to   { opacity: 1; transform: translateY(0); }
+      }
+      .cm-splash__logo {
+        position: relative;
+        width: 80px;
+        height: 80px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      /* Rotating accent ring around the mark — motion without noise.
+         Slightly larger than the logo so the ring sits around it. */
+      .cm-splash__logo::before {
+        content: "";
+        position: absolute;
+        inset: -6px;
+        border-radius: 50%;
+        border: 2px solid var(--cm-splash-ring);
+        border-top-color: var(--cm-splash-accent);
+        animation: cm-splash-spin 1.2s linear infinite;
+      }
+      .cm-splash__mark {
+        width: 64px;
+        height: 64px;
+        display: block;
+        /* no background/border — the logo art already has its own silhouette */
+      }
+      @keyframes cm-splash-spin {
+        from { transform: rotate(0deg); }
+        to   { transform: rotate(360deg); }
+      }
+      .cm-splash__title {
+        font-size: 13px;
+        font-weight: 500;
+        letter-spacing: 0.02em;
+        color: var(--cm-splash-fg);
+      }
+      .cm-splash__hint {
+        font-size: 11px;
+        color: var(--cm-splash-muted);
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root">
+      <!--
+        Placeholder splash. React replaces this whole subtree on mount;
+        until then the user sees the themed background + a tiny ring
+        spinner so the app "feels" alive instead of a blank rectangle.
+      -->
+      <div class="cm-splash" aria-hidden="true">
+        <div class="cm-splash__logo">
+          <!-- 128 px PNG copied to /public from the app-icon source.
+               Served as a static asset so it reaches the browser in
+               the first network round trip, same response as the HTML. -->
+          <img
+            class="cm-splash__mark"
+            src="/crystalmail-logo.png"
+            alt=""
+          />
+        </div>
+        <div class="cm-splash__title">CrystalMail</div>
+        <div class="cm-splash__hint">bereite mich für dich vor …</div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

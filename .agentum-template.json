@@ -1,0 +1,18 @@
+{
+  "generator": "agentum",
+  "projectName": "crystalmail",
+  "profile": "desktop-app",
+  "runtime": "rust",
+  "modules": [
+    "tauri",
+    "react",
+    "sqlite"
+  ],
+  "policies": [
+    "security-baseline",
+    "ci"
+  ],
+  "packageManager": "cargo",
+  "withCi": true,
+  "withMirrorFiles": false
+}

@@ -1,0 +1,26 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+build/
+src-tauri/target/
+target/
+
+# rust analyzer
+**/*.rs.bk
+Cargo.lock.*
+
+# environment
+.env
+.env.local
+.env.*.local
+
+# local data
+*.sqlite
+*.sqlite-*
+pi_session*.jsonl
+
+# system
+.DS_Store
+Thumbs.db

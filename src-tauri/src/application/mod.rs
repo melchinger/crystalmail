@@ -1,0 +1,21 @@
+// Application layer: orchestration between domain and infrastructure.
+pub mod actor;
+pub mod attachments;
+pub mod backup;
+pub mod body;
+pub mod contact_extract;
+pub mod contacts_io;
+pub mod draft_import;
+pub mod flags;
+pub mod message_ops;
+pub mod mark_read;
+pub mod prefetch;
+pub mod rule_scheduler;
+pub mod smtp;
+pub mod spam_analysis;
+pub mod spam_rules;
+pub mod sync;
+pub mod workflow_analyzer;
+pub mod workflow_rules;
+pub mod workflow_training;
+pub mod workflows;

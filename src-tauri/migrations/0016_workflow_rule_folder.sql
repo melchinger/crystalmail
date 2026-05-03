@@ -1,0 +1,11 @@
+-- Optional per-rule folder scope. NULL = "any folder on the scoped
+-- accounts" (the previous behaviour). Set to an IMAP folder path
+-- ("INBOX", "INBOX.Steuer") to narrow the match to mail that landed
+-- in that folder. Combined with `account_id` you can pinpoint
+-- "INBOX on the private mailbox" without firing on the work one.
+--
+-- We intentionally store the raw IMAP folder name, not an internal
+-- folder_id — a rule should survive folder-table rebuilds and stays
+-- portable across backup/restore. Downside: renaming the folder on
+-- the server decouples the rule; acceptable, users rename rarely.
+ALTER TABLE workflow_rules ADD COLUMN folder_name TEXT;

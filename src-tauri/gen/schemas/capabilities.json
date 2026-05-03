@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Default capabilities for the main CrystalMail window.","local":true,"windows":["main"],"permissions":["core:default","notification:default","store:default","os:default","dialog:default",{"identifier":"shell:allow-open","allow":[{"url":"https://**"},{"url":"http://**"},{"url":"mailto:**"}]}]}}
