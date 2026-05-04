@@ -15,7 +15,13 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 # ── Tauri core ────────────────────────────────────────────────────────────────
-tauri = { version = "2", features = ["tray-icon"] }
+# `devtools` aktiviert das Rechtsklick→Inspect-Menü auch in Release-
+# Builds. Wir lassen es bewusst auf — die App ist Open-Source, wer
+# sie bauen kann, kann sie eh debuggen, und für Bug-Reports brauchen
+# Endnutzer den Console-Output. Wenn das später Production-streng
+# werden soll, ein zweites Cargo-Feature `release-no-devtools` und
+# `default = ["devtools"]` mit Override-Möglichkeit.
+tauri = { version = "2", features = ["tray-icon", "devtools"] }
 tauri-plugin-single-instance = "2"
 tauri-plugin-store = "2"
 tauri-plugin-notification = "2"

@@ -1949,20 +1949,49 @@ function buildSandboxDoc(
   // hands it to Tauri's shell plugin which opens the OS-default browser
   // (not another Tauri window). Runs inside the "allow-scripts"-only
   // sandbox so it has no access to parent DOM, cookies, or storage.
+  //
+  // Defensive: damit's auch dann funktioniert, wenn das anchor-Element
+  // ein target=_blank oder eine Inline-Onclick-Logik traegt (Marketing-
+  // Mailer mit Tracking-Wrappern), preventDefault'en wir VOR jeder
+  // weiteren Logik. preventDefault-stopPropagation-stopImmediate sicher
+  // belegt, falls das Anchor-Element selbst einen Listener mit
+  // capture=false traegt.
+  console.log('[crystalmail-iframe] link-interceptor installed');
   document.addEventListener('click', function(e) {
     var el = e.target;
     while (el && el.nodeName !== 'A') el = el.parentNode;
     if (!el || !el.href) return;
     var href = el.getAttribute('href') || '';
-    if (!/^(https?:|mailto:)/i.test(href)) return;
+    if (!/^(https?:|mailto:)/i.test(href)) {
+      console.log('[crystalmail-iframe] click on non-http href — ignoring:', href);
+      return;
+    }
     e.preventDefault();
+    e.stopPropagation();
+    if (typeof e.stopImmediatePropagation === 'function') {
+      e.stopImmediatePropagation();
+    }
+    console.log('[crystalmail-iframe] forwarding click to parent:', el.href);
     try {
       window.parent.postMessage(
         { type: 'cm:open-url', href: el.href },
         '*'
       );
-    } catch (err) {}
+    } catch (err) {
+      console.error('[crystalmail-iframe] postMessage failed:', err);
+    }
   }, true);
+  // Zusaetzliche Schutzschicht: einige Mail-Engines geben Anchors einen
+  // submit-handler oder fuegen form-Wrapper drumrum. Wir blocken
+  // beide Defaults global, damit der iframe niemals nach extern
+  // navigiert. Visuelles Symptom des Fehlers war exakt das: WebView2
+  // versuchte die externe URL im iframe zu laden und die Block-
+  // Seite (X-Frame-Options / SmartScreen / corp policy) erschien.
+  window.addEventListener('beforeunload', function(e) {
+    console.warn('[crystalmail-iframe] beforeunload — blocking iframe navigation');
+    e.preventDefault();
+    e.returnValue = '';
+  });
 </script>
 </body>
 </html>`;

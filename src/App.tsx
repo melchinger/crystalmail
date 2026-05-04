@@ -1255,9 +1255,13 @@ export function App() {
       if (!data || data.type !== "cm:open-url" || !data.href) return;
       // Allow http/https/mailto only — matches the capability
       // whitelist in tauri.conf. Anything else is silently dropped.
-      if (!/^(https?:|mailto:)/i.test(data.href)) return;
+      if (!/^(https?:|mailto:)/i.test(data.href)) {
+        console.warn("[crystalmail] open-url rejected (not http/https/mailto):", data.href);
+        return;
+      }
+      console.log("[crystalmail] open-url:", data.href);
       void openUrl(data.href).catch((err: unknown) => {
-        console.error("open-url failed:", err);
+        console.error("[crystalmail] open-url failed:", err);
       });
     };
     window.addEventListener("message", onMessage);
