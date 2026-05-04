@@ -12,14 +12,62 @@ Early scaffolding. See `docs/plan.md` (or the approved plan at
 `~/.claude/plans/ich-bin-mit-den-graceful-noodle.md`) for the finalized
 architecture decisions (AD #1–#15).
 
-## Requirements
+## Install (End-User)
+
+Pre-built installers are published on the
+[Releases](https://github.com/melchinger/crystalmail/releases) page.
+
+| Platform | Download                                           |
+|----------|----------------------------------------------------|
+| Windows  | `CrystalMail_<v>_x64-setup.exe` (NSIS) oder `.msi` |
+| macOS    | `CrystalMail_<v>_universal.dmg` (Apple Silicon + Intel) |
+| Linux    | `crystalmail_<v>_amd64.AppImage` (empfohlen) oder `.deb` |
+
+⚠️ Builds sind nicht code-signiert — beim ersten Start einmalig
+SmartScreen-/Gatekeeper-Warnung wegklicken.
+
+### Linux: AppImage vs. `.deb`
+
+Auf Linux gibt's zwei Pakete. **AppImage ist der empfohlene Weg** — bringt
+seine WebKit-Runtime selbst mit, läuft auf jeder gängigen Distro.
+
+```bash
+chmod +x crystalmail_*_amd64.AppImage
+./crystalmail_*_amd64.AppImage
+```
+
+Falls AppImage nicht startet, fehlt meist `libfuse2`:
+```bash
+sudo apt install libfuse2     # Ubuntu/Debian/Mint
+```
+
+Das **`.deb`-Paket** braucht `libwebkit2gtk-4.1-0` (Tauri-2-Standard) und ist
+nur auf neueren Distros installierbar:
+
+| Distro                  | `.deb` läuft? |
+|-------------------------|---------------|
+| Ubuntu 24.04+           | ✓             |
+| Ubuntu 22.04 LTS        | ✓ (`universe`-Repo aktivieren) |
+| Debian 12 (Bookworm)    | ⚠️ via `backports` |
+| Debian 11 (Bullseye)    | ✗ — AppImage nutzen |
+| Linux Mint 21+          | ✓ (`universe`)|
+| Linux Mint 20.x         | ✗ — AppImage nutzen |
+| Fedora 38+ / Arch       | ✓ (eigene Build, AppImage geht aber auch) |
+
+Wenn `apt install` mit `Abhängigkeit nicht erfüllbar:
+libwebkit2gtk-4.1-0` abbricht, ist Deine Distro zu alt für das `.deb`. Nimm
+die AppImage — ohne Aufwand.
+
+## Build from Source
+
+### Requirements
 
 - Node.js 20+
 - Rust stable (via [rustup](https://rustup.rs))
 - Tauri v2 platform prerequisites ([Windows](https://v2.tauri.app/start/prerequisites/#windows) / macOS / Linux)
 - A local `pi` binary on `PATH` (configurable later via Settings)
 
-## Getting Started
+### Dev
 
 ```bash
 npm install
@@ -28,6 +76,16 @@ npm run tauri dev
 
 `npm run tauri dev` runs `cargo tauri dev`, which in turn spawns Vite
 (`beforeDevCommand`) and the Rust backend.
+
+### Release Build
+
+```bash
+npm run tauri build
+```
+
+Produces installers in `src-tauri/target/release/bundle/`. See
+[`docs/release.md`](docs/release.md) for the full release workflow
+(version bump, tag push, draft-release flow).
 
 ## Layout
 
