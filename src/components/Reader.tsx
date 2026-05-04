@@ -1669,7 +1669,28 @@ function BodyView({
     return null;
   }, [plain, html, cidMap, allowRemote]);
 
-  if (!srcDoc) {
+  // Statt `srcdoc` setzen wir den iframe per `src=blob:`. Hintergrund:
+  // srcdoc erbt die Parent-CSP — und Tauri 2 injiziert dort einen
+  // `nonce-…`. Per CSP3-Spec deaktiviert ein Nonce alle `'unsafe-inline'`
+  // im selben `script-src`/`style-src`. Folge: das Click-Interceptor-
+  // Skript im iframe-Body läuft nie, der Klick auf Links navigiert die
+  // iframe extern und WebView2 zeigt die "Inhalt blockiert"-Seite. Ein
+  // blob-URL-iframe ist dagegen ein eigenständiges Dokument; die im
+  // HTML eingebettete Meta-CSP gilt allein, der Parent-Nonce ist nicht
+  // mehr im Spiel. `frame-src blob:` wurde in der Tauri-CSP entsprechend
+  // erweitert.
+  const blobUrl = useMemo(() => {
+    if (!srcDoc) return null;
+    const blob = new Blob([srcDoc], { type: "text/html;charset=utf-8" });
+    return URL.createObjectURL(blob);
+  }, [srcDoc]);
+  useEffect(() => {
+    return () => {
+      if (blobUrl) URL.revokeObjectURL(blobUrl);
+    };
+  }, [blobUrl]);
+
+  if (!srcDoc || !blobUrl) {
     return (
       <div
         className="px-6 py-8 text-sm"
@@ -1817,7 +1838,7 @@ function BodyView({
       )}
       <iframe
         title="message"
-        srcDoc={srcDoc}
+        src={blobUrl}
         // `allow-scripts` is the minimum needed for our link-interceptor
         // to run inside the sandbox. We deliberately do NOT grant
         // `allow-same-origin` — the iframe stays null-origin, so even
