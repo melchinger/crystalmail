@@ -47,7 +47,9 @@ function formatAddress(c: AddressCompletion): string {
   // Anführungszeichen wenn der Name Sonderzeichen hat — minimaler
   // RFC-2822-Korrektheit-Aufwand.
   const needsQuote = /[",;<>@]/.test(name);
-  const safe = needsQuote ? `"${name.replace(/"/g, '\\"')}"` : name;
+  const safe = needsQuote
+    ? `"${name.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`
+    : name;
   return `${safe} <${c.email}>`;
 }
 
