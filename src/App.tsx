@@ -557,6 +557,18 @@ export function App() {
   );
 
   /**
+   * Tombstones for envelopes that have been optimistically popped but
+   * whose IMAP-side delete/archive/move hasn't been confirmed yet.
+   * `refresh` and `loadMoreOlder` filter against this set so a re-sync
+   * that fires between the optimistic-pop and the backend's expunge
+   * doesn't resurrect the row as a zombie. Cleared on backend failure
+   * (where `runOptimisticRemoval` also re-injects the row); on success
+   * the entry stays for the rest of the session — once a row is gone,
+   * it's gone, and the cost of a few stale ids in a Set is nil.
+   */
+  const optimisticallyRemovedRef = useRef<Set<string>>(new Set());
+
+  /**
    * Optimistic removal engine. Used by archive / delete / move — all three
    * have the same UI contract: the envelope vanishes from the list
    * immediately and the selection advances, even while the IMAP op is
@@ -575,6 +587,12 @@ export function App() {
     ) => {
       // Capture the row being removed so we can re-inject it on failure.
       let removed: EnvelopeSummary | undefined;
+
+      // Tombstone the id *before* the optimistic pop so any refresh
+      // that races in (e.g. a sync-progress auto-refresh that landed
+      // mid-click) filters this row out of its result set instead of
+      // putting it back on screen.
+      optimisticallyRemovedRef.current.add(id);
 
       setInbox((rows) => {
         const idx = rows.findIndex((r) => r.id === id);
@@ -613,6 +631,9 @@ export function App() {
         .catch((e) => {
           console.error("mutation failed:", e);
           setStatus(errorMessage(String(e)));
+          // Lift the tombstone first — otherwise the re-injected row
+          // would be filtered straight back out by the next refresh.
+          optimisticallyRemovedRef.current.delete(id);
           // Re-inject at the natural (date-desc) position. Don't touch
           // selection — the user has moved on.
           if (removed) {
@@ -1101,6 +1122,30 @@ export function App() {
   const refreshRef = useRef<(() => Promise<void>) | null>(null);
   const refreshUnreadCountsRef = useRef<(() => Promise<void>) | null>(null);
 
+  // Live mirror of the view-selection tuple so an in-flight `refresh`
+  // can detect that the user navigated away during its IMAP/DB round-
+  // trip. Without this, a captured-closure refresh (e.g. from
+  // `syncAll`'s tail or a sync-progress auto-refresh that started
+  // before the click) writes the *previous* folder's rows into the
+  // inbox state and catapults the user out of the folder they're
+  // currently looking at.
+  const activeFolderRef = useRef(activeFolder);
+  const selectedFolderRef = useRef(selectedFolder);
+  const accountFilterRef = useRef(accountFilter);
+  const searchQueryRef = useRef(searchQuery);
+  useEffect(() => {
+    activeFolderRef.current = activeFolder;
+  }, [activeFolder]);
+  useEffect(() => {
+    selectedFolderRef.current = selectedFolder;
+  }, [selectedFolder]);
+  useEffect(() => {
+    accountFilterRef.current = accountFilter;
+  }, [accountFilter]);
+  useEffect(() => {
+    searchQueryRef.current = searchQuery;
+  }, [searchQuery]);
+
   // Subscribe to live sync progress. Same StrictMode-cancellation
   // pattern as the pi chat-stream listener: the `listen()` resolution
   // is async, so a hastily-mounted-then-unmounted effect in dev would
@@ -1385,6 +1430,16 @@ export function App() {
 
   const refresh = useCallback(
     async (limitOverride?: number) => {
+      // Snapshot the view this fetch corresponds to. `fetchInboxFor`
+      // closes over the same tuple, so its rows describe exactly this
+      // selection. If the user clicks a different folder while the
+      // backend round-trip is in flight, the live refs drift away
+      // from the snapshot and we drop the result instead of writing
+      // stale rows into the inbox state.
+      const expectedFolder = activeFolder;
+      const expectedSelected = selectedFolder?.folderId ?? null;
+      const expectedAccountFilter = accountFilter;
+      const expectedQuery = searchQuery;
       try {
         const accs = await invoke<AccountSummary[]>("list_accounts");
         setAccounts(sortAccounts(accs));
@@ -1401,13 +1456,38 @@ export function App() {
         const limit = limitOverride ?? baseLimit;
         const result = await fetchInboxFor(limit);
         if (!result) return;
-        setInbox(result.rows);
+        if (
+          activeFolderRef.current !== expectedFolder ||
+          (selectedFolderRef.current?.folderId ?? null) !== expectedSelected ||
+          accountFilterRef.current !== expectedAccountFilter ||
+          searchQueryRef.current !== expectedQuery
+        ) {
+          return;
+        }
+        // Filter out optimistically-removed rows so a re-sync between
+        // the user's delete/archive/move and the IMAP-side expunge
+        // doesn't resurrect them.
+        const tomb = optimisticallyRemovedRef.current;
+        const visibleRows =
+          tomb.size === 0
+            ? result.rows
+            : result.rows.filter((r) => !tomb.has(r.id));
+        setInbox(visibleRows);
         setSearchError(result.searchError);
       } catch (e) {
         setStatus(t("common.error", { message: String(e) }));
       }
     },
-    [t, pageSize, searchQuery, fetchInboxFor, refreshUnreadCounts],
+    [
+      t,
+      pageSize,
+      searchQuery,
+      fetchInboxFor,
+      refreshUnreadCounts,
+      activeFolder,
+      accountFilter,
+      selectedFolder,
+    ],
   );
 
   // Pendant zur Ref-Deklaration weiter oben: synchronisiert die Refs mit
@@ -1542,12 +1622,18 @@ export function App() {
         // — pure SQL — and covers the common case where the user has
         // way more mail in the DB than the initial window showed.
         const grown = await fetchInboxFor(nextSize);
-        if (grown) {
-          setInbox(grown.rows);
-          setSearchError(grown.searchError);
+        const tomb = optimisticallyRemovedRef.current;
+        const grownVisible =
+          grown && tomb.size > 0
+            ? { ...grown, rows: grown.rows.filter((r) => !tomb.has(r.id)) }
+            : grown;
+        if (grownVisible) {
+          setInbox(grownVisible.rows);
+          setSearchError(grownVisible.searchError);
         }
 
-        const grewLocally = (grown?.rows.length ?? beforeLen) > beforeLen;
+        const grewLocally =
+          (grownVisible?.rows.length ?? beforeLen) > beforeLen;
         if (grewLocally) {
           setPageSize(nextSize);
           return;
@@ -1584,7 +1670,12 @@ export function App() {
           // so they show up.
           const refreshed = await fetchInboxFor(nextSize);
           if (refreshed) {
-            setInbox(refreshed.rows);
+            const tomb2 = optimisticallyRemovedRef.current;
+            const visibleRows =
+              tomb2.size === 0
+                ? refreshed.rows
+                : refreshed.rows.filter((r) => !tomb2.has(r.id));
+            setInbox(visibleRows);
             setSearchError(refreshed.searchError);
           }
           setPageSize(nextSize);
