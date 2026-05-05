@@ -115,6 +115,17 @@ export function AddAccountDialog({ initial, onSaved, onDeleted, onClose }: Props
   const [saveError, setSaveError] = useState<string | null>(null);
   const [discovering, setDiscovering] = useState(false);
   const [discoveryInfo, setDiscoveryInfo] = useState<string | null>(null);
+  // Duplicate-Address-Prompt: wenn das Backend `add_account` mit
+  // `kind: "duplicate_address"` ablehnt, zeigen wir hier den Refresh-
+  // Credentials-Dialog. Auf "Ja" wird intern `update_account` gegen die
+  // existierende ID gefeuert — der Account-Row, die History und die
+  // Mail-Cache bleiben erhalten, nur Passwort und Server-Settings werden
+  // erneuert.
+  const [duplicate, setDuplicate] = useState<{
+    existingId: string;
+    existingDisplayName: string;
+    address: string;
+  } | null>(null);
   const signatureRef = useRef<RichEditorHandle>(null);
   // Signature edit mode: "rich" uses the WYSIWYG editor, "html" exposes
   // raw HTML source for paste-from-clipboard workflows. We sync on every
@@ -294,7 +305,102 @@ export function AddAccountDialog({ initial, onSaved, onDeleted, onClose }: Props
         onSaved(saved);
       }
     } catch (e) {
-      setSaveError(String(e));
+      // Strukturierte Backend-Fehler (Tauri liefert das `Err`-JSON
+      // direkt als rejected Value) erkennen wir am `kind`-Diskriminator.
+      // Beim Duplicate-Fall öffnen wir den Refresh-Credentials-Dialog
+      // statt die rohe Sqlite-UNIQUE-Meldung anzuzeigen.
+      const tagged =
+        e && typeof e === "object" && "kind" in e
+          ? (e as { kind: string; [k: string]: unknown })
+          : null;
+      if (tagged?.kind === "duplicate_address") {
+        const dup = tagged as unknown as {
+          existingId: string;
+          displayName: string;
+          address: string;
+        };
+        setDuplicate({
+          existingId: dup.existingId,
+          existingDisplayName: dup.displayName,
+          address: dup.address,
+        });
+      } else if (
+        tagged?.kind === "other" &&
+        typeof tagged.message === "string"
+      ) {
+        // `Other`-Variante: nur die Message anzeigen, nicht das ganze
+        // serialisierte Objekt — das ergäbe sonst „[object Object]".
+        setSaveError(tagged.message);
+      } else {
+        setSaveError(typeof e === "string" ? e : String(e));
+      }
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  /**
+   * "Ja, Zugangsdaten erneuern" aus dem Duplicate-Dialog. Baut aus dem
+   * aktuellen Form-State eine `UpdateAccountForm` gegen die existierende
+   * Account-ID und feuert `update_account` — Mail-Cache, Folder-IDs und
+   * History bleiben damit erhalten, nur Passwort + die hier eingegebenen
+   * Server-Settings werden überschrieben.
+   */
+  const relinkExisting = async () => {
+    if (!duplicate) return;
+    setSaving(true);
+    setSaveError(null);
+    try {
+      const sigHtml =
+        sigMode === "rich"
+          ? signatureRef.current?.getHtml() ?? ""
+          : sigHtmlSource;
+      const sigPlain =
+        sigMode === "rich"
+          ? signatureRef.current?.getText() ?? ""
+          : htmlToPlain(sigHtmlSource);
+      const payload: UpdateAccountForm = {
+        id: duplicate.existingId,
+        displayName: form.displayName,
+        address: form.address,
+        fromName: form.fromName,
+        color: form.color,
+        signature: sigPlain.trim().length > 0 ? sigPlain : null,
+        signatureHtml: sigHtml.trim().length > 0 ? sigHtml : null,
+        imapHost: form.imapHost,
+        imapPort: form.imapPort,
+        imapTls: form.imapTls,
+        smtpHost: form.smtpHost,
+        smtpPort: form.smtpPort,
+        smtpTls: form.smtpTls,
+        archiveFolder: form.archiveFolder,
+        sentFolder: form.sentFolder,
+        draftsFolder: form.draftsFolder,
+        trashFolder: form.trashFolder,
+        spamFolder: form.spamFolder,
+        archiveOnReply: form.archiveOnReply,
+        prefetchDays: form.prefetchDays,
+        syncMode: form.syncMode,
+        serverStoresSent: form.serverStoresSent,
+        aliases: form.aliases,
+        password: form.password || null,
+        skipTest: false,
+      };
+      const saved = await invoke<AccountSummary>("update_account", {
+        form: payload,
+      });
+      setDuplicate(null);
+      onSaved(saved);
+    } catch (e) {
+      // Fehler aus dem Update-Pfad: Duplicate-Overlay schließen, damit
+      // der Fehler im Haupt-Formular sichtbar wird (saveError wird
+      // unterhalb des Forms gerendert und wäre sonst vom Overlay
+      // verdeckt). Das eingegebene Passwort und alle Form-Werte bleiben
+      // erhalten — der User kann direkt korrigieren und erneut „Konto
+      // speichern" klicken; das Backend erkennt die Adresse wieder als
+      // Duplicate und öffnet diesen Dialog von Neuem.
+      setDuplicate(null);
+      setSaveError(typeof e === "string" ? e : String(e));
     } finally {
       setSaving(false);
     }
@@ -386,6 +492,67 @@ export function AddAccountDialog({ initial, onSaved, onDeleted, onClose }: Props
         if (e.target === e.currentTarget) onClose();
       }}
     >
+      {duplicate && (
+        <div
+          className="fixed inset-0 z-[60] flex items-center justify-center px-4"
+          style={{ background: "rgba(0,0,0,0.55)" }}
+          role="alertdialog"
+          aria-modal="true"
+          onMouseDown={(e) => {
+            // Outside-click = abbrechen, identisch zum Haupt-Backdrop.
+            if (e.target === e.currentTarget) setDuplicate(null);
+          }}
+        >
+          <div
+            className="w-full max-w-md rounded-xl border p-5 shadow-xl"
+            style={{
+              background: "var(--bg-panel)",
+              borderColor: "var(--border-base)",
+              color: "var(--fg-base)",
+            }}
+          >
+            <h3 className="mb-2 text-base font-semibold">
+              {t("accounts.duplicateTitle")}
+            </h3>
+            <p
+              className="mb-3 text-sm"
+              style={{ color: "var(--fg-base)" }}
+            >
+              {t("accounts.duplicateBody", {
+                address: duplicate.address,
+                name: duplicate.existingDisplayName,
+              })}
+            </p>
+            <p
+              className="mb-4 text-xs"
+              style={{ color: "var(--fg-subtle)" }}
+            >
+              {t("accounts.duplicateHint")}
+            </p>
+            <div className="flex flex-wrap justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setDuplicate(null)}
+                className="rounded-md px-3 py-1.5 text-sm"
+                style={{ color: "var(--fg-muted)" }}
+              >
+                {t("accounts.cancel")}
+              </button>
+              <button
+                type="button"
+                onClick={() => void relinkExisting()}
+                disabled={saving}
+                className="rounded-md px-3 py-1.5 text-sm font-medium disabled:opacity-50"
+                style={{ background: "var(--accent)", color: "white" }}
+              >
+                {saving
+                  ? t("accounts.saving")
+                  : t("accounts.duplicateConfirm")}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       <form
         onSubmit={onSubmit}
         className="max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-xl border p-5 shadow-xl"

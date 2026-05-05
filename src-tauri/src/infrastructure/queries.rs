@@ -135,6 +135,31 @@ pub fn get_account(
     }
 }
 
+/// Lookup an account by its e-mail address. Used by `add_account`'s
+/// duplicate-pre-check so we can hand the existing account's id back to
+/// the frontend instead of letting the bare `accounts.address UNIQUE`
+/// SQLite constraint fire as an unhelpful raw error.
+///
+/// Comparison is case-sensitive to mirror the DB constraint exactly —
+/// the `UNIQUE` index on `accounts.address` has no `COLLATE NOCASE`, so
+/// an insert of a case-variant address would actually succeed and we
+/// shouldn't pre-empt that here.
+pub fn find_account_by_address(
+    conn: &ReadConn,
+    address: &str,
+) -> Result<Option<AccountSummary>, DbError> {
+    let sql = format!("SELECT {ACCOUNT_COLS} FROM accounts WHERE address = ?1");
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query(rusqlite::params![address])?;
+    if let Some(row) = rows.next()? {
+        let mut summary = map_account_summary(row)?;
+        summary.aliases = list_aliases_for(conn, &summary.id)?;
+        Ok(Some(summary))
+    } else {
+        Ok(None)
+    }
+}
+
 fn list_aliases_for(
     conn: &ReadConn,
     account_id: &AccountId,
