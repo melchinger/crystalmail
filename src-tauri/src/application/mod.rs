@@ -7,6 +7,7 @@ pub mod contact_extract;
 pub mod contacts_io;
 pub mod draft_import;
 pub mod flags;
+pub mod ics;
 pub mod message_ops;
 pub mod mark_read;
 pub mod prefetch;

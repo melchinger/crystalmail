@@ -770,7 +770,7 @@ dependencies = [
 
 [[package]]
 name = "crystalmail"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -782,6 +782,7 @@ dependencies = [
  "dirs",
  "futures-util",
  "getrandom 0.2.17",
+ "ical",
  "keyring",
  "lettre",
  "mail-parser",
@@ -1983,6 +1984,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f31827a206f56af32e590ba56d5d2d085f558508192593743f16b2306495269f"
 dependencies = [
  "cc",
+]
+
+[[package]]
+name = "ical"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d4bad4eb99ee34e58a1e642114eded65b4ea5ea3c1584971a1afc12a3b927670"
+dependencies = [
+ "thiserror 1.0.69",
 ]
 
 [[package]]

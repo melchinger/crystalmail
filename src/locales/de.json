@@ -154,6 +154,28 @@
     "openTooltip": "Mit Standardprogramm öffnen — {{mime}} · {{size}}",
     "saveTooltip": "Speichern unter …"
   },
+  "calendar": {
+    "invitation": {
+      "label": "Termineinladung",
+      "untitled": "(ohne Titel)",
+      "when": "Wann",
+      "where": "Wo",
+      "organizer": "Einlader",
+      "accept": "Annehmen",
+      "tentative": "Vielleicht",
+      "decline": "Ablehnen",
+      "subject": {
+        "accepted": "Zugesagt: {{summary}}",
+        "tentative": "Vorbehalt: {{summary}}",
+        "declined": "Abgesagt: {{summary}}"
+      },
+      "body": {
+        "accepted": "Ich habe die Einladung „{{summary}}\" angenommen.",
+        "tentative": "Ich habe die Einladung „{{summary}}\" mit Vorbehalt angenommen.",
+        "declined": "Ich habe die Einladung „{{summary}}\" abgelehnt."
+      }
+    }
+  },
   "compose": {
     "title": "Neue Nachricht",
     "replyTitle": "Antwort",

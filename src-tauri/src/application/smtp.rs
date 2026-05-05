@@ -706,6 +706,9 @@ fn build_message(account: &AccountSummary, req: &SendMailRequest) -> Result<Mess
     //   attachments + plain → mixed(plain, <file...>)
     //   html (no atts)      → alternative(plain, html)
     //   plain (no atts)     → single text/plain
+    //   iMIP (RFC 6047)     → alternative(plain, text/calendar)
+    //                         — overrides the above when the only attachment
+    //                         is `text/calendar` with a `method=` parameter.
     let has_attachments = !req.attachments.is_empty();
     let has_html = req.body_html.as_deref().map(|s| !s.is_empty()).unwrap_or(false);
 
@@ -714,6 +717,40 @@ fn build_message(account: &AccountSummary, req: &SendMailRequest) -> Result<Mess
             .header(ContentType::TEXT_PLAIN)
             .body(req.body.clone())
             .map_err(|e| format!("Message bauen: {e}"))
+    }
+
+    // Diagnostic-first: log every dispatch so we can verify which path the
+    // outgoing message went through without guessing from RFC822 dumps.
+    let first_mime = req
+        .attachments
+        .first()
+        .and_then(|a| a.mime_type.as_deref())
+        .unwrap_or("(none)");
+    let imip_match = req.attachments.len() == 1 && is_imip_attachment(&req.attachments[0]);
+    tracing::info!(
+        attachments = req.attachments.len(),
+        first_mime = %first_mime,
+        has_html = has_html,
+        imip = imip_match,
+        "send: build_message dispatch"
+    );
+
+    // iMIP detection: a single text/calendar attachment carrying a `method=`
+    // parameter is the signature of a calendar invitation reply/request. In
+    // that case the spec (RFC 6047 §2.4) and field practice both expect the
+    // calendar body to be a multipart/alternative sibling of the text body —
+    // not wrapped in a multipart/mixed as an attachment. Outlook and several
+    // groupware servers (Zoho among them) only auto-process the iMIP message
+    // when they find the calendar payload at the alternative level. Falling
+    // through to multipart/mixed produces a mail that arrives but is
+    // displayed as a normal message with an .ics attachment instead.
+    //
+    // We allow `has_html` because Compose's rich editor always emits an HTML
+    // body even for plain user input — Outlook/Apple Mail also produce a
+    // three-part alternative (plain + html + calendar) for invitation
+    // replies, so we match that shape rather than dropping the html part.
+    if imip_match {
+        return build_imip_alternative(builder, req, has_html);
     }
 
     let text_part = SinglePart::builder()
@@ -769,6 +806,121 @@ fn build_message(account: &AccountSummary, req: &SendMailRequest) -> Result<Mess
     builder
         .multipart(mixed)
         .map_err(|e| format!("Message bauen: {e}"))
+}
+
+/// True when the attachment looks like an iMIP calendar payload — i.e. the
+/// caller wants the SMTP path to embed it as a multipart/alternative body
+/// part, not wrap it as a multipart/mixed attachment. We detect on the
+/// `method=` Content-Type parameter, which RFC 6047 mandates and which
+/// non-iMIP plain-`text/calendar` files (e.g. exported .ics from a calendar
+/// view) won't carry.
+fn is_imip_attachment(spec: &AttachmentSpec) -> bool {
+    let Some(mime) = spec.mime_type.as_deref() else {
+        return false;
+    };
+    let lower = mime.to_ascii_lowercase();
+    let mut parts = lower.split(';').map(|s| s.trim());
+    let Some(top) = parts.next() else {
+        return false;
+    };
+    if top != "text/calendar" {
+        return false;
+    }
+    parts.any(|p| p.starts_with("method="))
+}
+
+/// Build an iMIP-shaped message: top-level `multipart/alternative` of
+///   text/plain + (optional) text/html + text/calendar
+///
+/// The text/calendar part carries the full Content-Type including `method=`.
+/// We route it through `SinglePart::builder()` rather than the regular
+/// `Attachment::new(...)` helper so we can stamp the exact Content-Type and
+/// avoid the `Content-Disposition: attachment` that `Attachment` would
+/// impose — receiving calendar servers (Zoho, Outlook, Google) want the
+/// payload as an alternative body, not as a downloadable attachment.
+fn build_imip_alternative(
+    builder: MessageBuilder,
+    req: &SendMailRequest,
+    include_html: bool,
+) -> Result<Message, String> {
+    let spec = &req.attachments[0];
+    let path = std::path::Path::new(&spec.path);
+    let bytes = std::fs::read(path)
+        .map_err(|e| format!("iMIP-ICS lesen ({}): {e}", spec.path))?;
+    let ics_text = String::from_utf8(bytes)
+        .map_err(|e| format!("iMIP-ICS ist kein UTF-8: {e}"))?;
+    let mime = spec
+        .mime_type
+        .as_deref()
+        .ok_or("iMIP-Anhang ohne Content-Type")?;
+    let calendar_ct = ContentType::parse(mime)
+        .map_err(|e| format!("iMIP Content-Type ungültig '{mime}': {e}"))?;
+
+    let text_part = SinglePart::builder()
+        .header(ContentType::TEXT_PLAIN)
+        .body(req.body.clone());
+    let calendar_part = SinglePart::builder()
+        .header(calendar_ct)
+        .body(ics_text);
+
+    let mut alternative = MultiPart::alternative().singlepart(text_part);
+    if include_html {
+        let html_body = req.body_html.clone().unwrap_or_default();
+        let html_part = SinglePart::builder()
+            .header(ContentType::TEXT_HTML)
+            .body(html_body);
+        alternative = alternative.singlepart(html_part);
+    }
+    alternative = alternative.singlepart(calendar_part);
+
+    builder
+        .multipart(alternative)
+        .map_err(|e| format!("iMIP Message bauen: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(mime: Option<&str>) -> AttachmentSpec {
+        AttachmentSpec {
+            path: "/tmp/x.ics".into(),
+            filename: None,
+            mime_type: mime.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn imip_detect_positive_with_method() {
+        assert!(is_imip_attachment(&spec(Some(
+            "text/calendar; method=REPLY; charset=utf-8"
+        ))));
+    }
+
+    #[test]
+    fn imip_detect_positive_with_method_lowercase_first() {
+        assert!(is_imip_attachment(&spec(Some(
+            "text/calendar; charset=utf-8; method=request"
+        ))));
+    }
+
+    #[test]
+    fn imip_detect_negative_without_method() {
+        // A plain calendar export — should ride the regular attachment path.
+        assert!(!is_imip_attachment(&spec(Some(
+            "text/calendar; charset=utf-8"
+        ))));
+    }
+
+    #[test]
+    fn imip_detect_negative_other_mime() {
+        assert!(!is_imip_attachment(&spec(Some("application/pdf"))));
+    }
+
+    #[test]
+    fn imip_detect_negative_no_mime() {
+        assert!(!is_imip_attachment(&spec(None)));
+    }
 }
 
 fn guess_mime(path: &std::path::Path) -> String {

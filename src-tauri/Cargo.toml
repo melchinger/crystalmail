@@ -1,6 +1,6 @@
 [package]
 name = "crystalmail"
-version = "0.1.2"
+version = "0.2.0"
 description = "Clean, fast, local-first IMAP mail client with pi-powered AI features"
 authors = ["melchinger"]
 edition = "2021"
@@ -52,6 +52,12 @@ lettre = { version = "0.11", default-features = false, features = [
   "hostname",
 ] }
 mail-parser = "0.9"
+
+# ── iCalendar parsing for invitation handling (Phase 0 calendar) ──────────────
+# RFC 5545 parser. We use it only to read invitations from incoming mail
+# attachments — outgoing REPLY ICS is hand-built (small, well-defined shape,
+# avoids depending on the crate's writer surface).
+ical = { version = "0.10", default-features = false, features = ["ical"] }
 
 # ── Local store (SQLite) + full-text search via FTS5 ──────────────────────────
 # Encrypted-at-rest via SQLCipher. The `bundled-sqlcipher-vendored-openssl`

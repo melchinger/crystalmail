@@ -11,6 +11,7 @@ import {
 } from "./WorkflowPromptDialog";
 import { WorkflowResultDialog } from "./WorkflowResultDialog";
 import { decodeImapFolderName } from "../utils/imapFolderName";
+import { IcsInvitePanel } from "./IcsInvitePanel";
 import {
   TRUSTED_SENDERS_CHANGED,
   addTrustedDomain,
@@ -972,6 +973,13 @@ function MessageView({
       </header>
 
       <AttachmentBar messageId={env.id} attachments={detail.attachments} />
+
+      <IcsInvitePanel
+        messageId={env.id}
+        attachments={detail.attachments}
+        account={account}
+        onCompose={onCompose}
+      />
 
       <div className="min-h-0 flex-1 overflow-hidden">
         <BodyView
