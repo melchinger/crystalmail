@@ -1663,9 +1663,10 @@ function BodyView({
   const srcDoc = useMemo(() => {
     if (html) {
       const resolved = resolveCidImages(html, cidMap);
-      return buildSandboxDoc(resolved, false, allowRemote);
+      const gated = allowRemote ? resolved : blockRemoteImages(resolved);
+      return buildSandboxDoc(gated, false);
     }
-    if (plain) return buildSandboxDoc(escapeHtml(plain), true, false);
+    if (plain) return buildSandboxDoc(escapeHtml(plain), true);
     return null;
   }, [plain, html, cidMap, allowRemote]);
 
@@ -1871,10 +1872,54 @@ function resolveCidImages(
   );
 }
 
+/// 1x1 transparent GIF — placeholder for blocked remote images. Keeps
+/// the `<img>` element in the layout (so width/height/alt/style attrs
+/// keep working) without triggering a network request.
+const BLOCKED_IMAGE_PIXEL =
+  "data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==";
+
+/// Replace `src` on every remote `<img>` with a transparent pixel and
+/// move the original URL to `data-blocked-src`. Also strip `srcset`
+/// (moved to `data-blocked-srcset`) so the browser can't pick a
+/// candidate behind our back. CIDs are already resolved to `data:`
+/// URLs by `resolveCidImages`, so this only ever touches `https?:`
+/// (and protocol-relative `//host/…`) refs.
+///
+/// Why HTML rewriting instead of CSP-only gating: WebKit (macOS
+/// WKWebView) doesn't reliably re-apply a sandbox+blob iframe's meta-
+/// CSP when its `src` toggles between two blob URLs — the old
+/// document context can stick, leaving the gate effectively closed
+/// even after the user clicked "Bilder laden". Stripping at the HTML
+/// layer is engine-independent and lets the iframe CSP stay static.
+function blockRemoteImages(html: string): string {
+  if (!html) return html;
+  let doc: Document;
+  try {
+    doc = new DOMParser().parseFromString(
+      `<!DOCTYPE html><body>${html}</body>`,
+      "text/html",
+    );
+  } catch {
+    return html;
+  }
+  doc.querySelectorAll("img").forEach((img) => {
+    const src = img.getAttribute("src");
+    if (src && /^(https?:|\/\/)/i.test(src.trim())) {
+      img.setAttribute("data-blocked-src", src);
+      img.setAttribute("src", BLOCKED_IMAGE_PIXEL);
+    }
+    const srcset = img.getAttribute("srcset");
+    if (srcset) {
+      img.setAttribute("data-blocked-srcset", srcset);
+      img.removeAttribute("srcset");
+    }
+  });
+  return doc.body?.innerHTML ?? html;
+}
+
 function buildSandboxDoc(
   innerHtml: string,
   preformatted: boolean,
-  allowRemoteImages: boolean,
 ): string {
   // Mail-HTML kommt oft als komplettes Dokument (`<html><body style="…">…`).
   // Wenn wir das 1:1 in unseren Sandbox-Body kippen, klemmt's: Browser
@@ -1903,9 +1948,12 @@ function buildSandboxDoc(
   //
   // Rules:
   // - `default-src 'none'`  — deny everything by default; opt in below.
-  // - `img-src data:` (+`http: https:` after user clicks "Bilder laden")
-  //   — inline CIDs resolved to data: URLs always work; remote images
-  //   are user-gated to defeat tracking pixels.
+  // - `img-src data: https: http:` — CIDs (data:) and remote refs both
+  //   permitted at the CSP layer. The remote-image gate is enforced one
+  //   step earlier by `blockRemoteImages` rewriting `<img src=https…>`
+  //   to a transparent pixel when the user hasn't opted in. Engine-
+  //   agnostic: doesn't rely on WebKit re-applying meta-CSP on iframe
+  //   src changes (which it doesn't reliably do).
   // - `style-src 'unsafe-inline'` — needed for the inline `<style>` block
   //   we ship with the iframe AND for sender's inline `style="…"` attrs.
   // - `script-src 'unsafe-inline'` — only the hard-coded link-interceptor
@@ -1913,10 +1961,7 @@ function buildSandboxDoc(
   // - `font-src data:` — data-URL embedded fonts are allowed; remote
   //   fonts are blocked (another tracking vector).
   // ──────────────────────────────────────────────────────────────────────
-  const imgSrc = allowRemoteImages
-    ? "data: https: http:"
-    : "data:";
-  const csp = `default-src 'none'; img-src ${imgSrc}; style-src 'unsafe-inline'; script-src 'unsafe-inline'; font-src data:;`;
+  const csp = `default-src 'none'; img-src data: https: http:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; font-src data:;`;
   return `<!DOCTYPE html>
 <html>
   <head>
