@@ -88,20 +88,34 @@ export function plainToHtml(s: string): string {
 }
 
 export function stripHtmlToText(html: string): string {
-  return html
-    .replace(/<style[\s\S]*?<\/style>/gi, "")
-    .replace(/<script[\s\S]*?<\/script>/gi, "")
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<\/p>/gi, "\n\n")
-    .replace(/<[^>]+>/g, "")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+  if (!html) return "";
+  try {
+    const doc = new DOMParser().parseFromString(html, "text/html");
+
+    doc.querySelectorAll("script, style").forEach((n) => n.remove());
+    doc.querySelectorAll("br").forEach((n) => n.replaceWith("\n"));
+    doc
+      .querySelectorAll("p, div, li, tr, blockquote, h1, h2, h3, h4, h5, h6")
+      .forEach((n) => n.append("\n"));
+
+    return (doc.body?.textContent ?? "")
+      .replace(/\u00a0/g, " ")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+  } catch {
+    return html
+      .replace(/<br\s*\/?>/gi, "\n")
+      .replace(/<\/p>/gi, "\n\n")
+      .replace(/<[^>]+>/g, "")
+      .replace(/&nbsp;/g, " ")
+      .replace(/&amp;/g, "&")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+  }
 }
 
 /**
