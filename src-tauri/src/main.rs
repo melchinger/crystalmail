@@ -334,6 +334,8 @@ fn main() {
             commands::workflows::list_rule_action_log,
             commands::draft_import::prepare_draft_from_template,
             commands::draft_import::consume_pending_import_drafts,
+            commands::calendar::ics_parse_attachment,
+            commands::calendar::ics_build_invitation_reply,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")

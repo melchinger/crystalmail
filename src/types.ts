@@ -405,6 +405,46 @@ export type AttachmentMeta = {
   isInline: boolean;
 };
 
+// ─── Calendar — Phase 0 (read-only ICS handling, no local store yet) ──────
+
+export type IcsParticipant = {
+  email: string;
+  displayName: string | null;
+};
+
+export type ParsedIcsEvent = {
+  /** VCALENDAR-level METHOD ("REQUEST", "REPLY", "CANCEL", …). null when the
+   *  ICS has no METHOD property — typically a calendar publication rather
+   *  than an invitation. */
+  method: string | null;
+  uid: string;
+  sequence: number;
+  summary: string | null;
+  description: string | null;
+  location: string | null;
+  /** Raw RFC 5545 timestamp string. Frontend formats for display. */
+  dtstart: string | null;
+  dtend: string | null;
+  organizer: IcsParticipant | null;
+  attendees: IcsParticipant[];
+  /** True when the event has at least one attendee — drives the visibility
+   *  of the Annehmen/Vielleicht/Ablehnen buttons. */
+  isInvitation: boolean;
+};
+
+export type InvitationResponse = "accepted" | "tentative" | "declined";
+
+export type InvitationReplyDraft = {
+  response: InvitationResponse;
+  eventSummary: string | null;
+  eventDtstart: string | null;
+  recipientEmail: string;
+  recipientDisplayName: string | null;
+  attachmentPath: string;
+  attachmentFilename: string;
+  attachmentSizeBytes: number;
+};
+
 export type MessageDetail = {
   envelope: EnvelopeDetail;
   plainText: string | null;
