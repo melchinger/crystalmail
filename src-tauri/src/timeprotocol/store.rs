@@ -30,7 +30,8 @@ pub fn list_in_range(
         "SELECT id, uid, sequence, summary, description, location,
                 start_at, end_at, original_tzid,
                 organizer_email, organizer_name,
-                source, source_message_id, created_at, updated_at, status
+                source, source_message_id, created_at, updated_at, status,
+                last_published_sequence
          FROM commitments
          WHERE start_at < ?2 AND end_at > ?1
            AND status != 'CANCELLED'
@@ -54,7 +55,8 @@ pub fn get_with_attendees(
         "SELECT id, uid, sequence, summary, description, location,
                 start_at, end_at, original_tzid,
                 organizer_email, organizer_name,
-                source, source_message_id, created_at, updated_at, status
+                source, source_message_id, created_at, updated_at, status,
+                last_published_sequence
          FROM commitments WHERE id = ?1",
     )?;
     let mut commitment: Option<Commitment> = stmt
@@ -64,6 +66,36 @@ pub fn get_with_attendees(
         c.attendees = fetch_attendees(conn, &c.id)?;
     }
     Ok(commitment)
+}
+
+/// List **all** commitments (including CANCELLED) for the IMAP-sync
+/// path. The list view filters CANCELLED rows out for the UI; the sync
+/// path needs them so cancellation tombstones get published per
+/// ADR-0011 §6.1.
+pub fn list_all_with_attendees(
+    conn: &Connection,
+) -> Result<Vec<Commitment>, DbError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, uid, sequence, summary, description, location,
+                start_at, end_at, original_tzid,
+                organizer_email, organizer_name,
+                source, source_message_id, created_at, updated_at, status,
+                last_published_sequence
+         FROM commitments
+         ORDER BY uid ASC",
+    )?;
+    let rows = stmt.query_map([], row_to_commitment_no_attendees)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    // Hydrate attendees per row. Could be a single JOIN+GROUP query, but
+    // Phase-2 v1 calendars are small (<1000 active rows) and the per-row
+    // query keeps the row-mapping shared with the other read paths.
+    for c in out.iter_mut() {
+        c.attendees = fetch_attendees(conn, &c.id)?;
+    }
+    Ok(out)
 }
 
 /// Lookup by RFC 5545 UID. Currently unused at the call-site level (the
@@ -79,7 +111,8 @@ pub fn get_by_uid(
         "SELECT id, uid, sequence, summary, description, location,
                 start_at, end_at, original_tzid,
                 organizer_email, organizer_name,
-                source, source_message_id, created_at, updated_at, status
+                source, source_message_id, created_at, updated_at, status,
+                last_published_sequence
          FROM commitments WHERE uid = ?1",
     )?;
     let mut commitment: Option<Commitment> = stmt
@@ -134,6 +167,7 @@ fn row_to_commitment_no_attendees(
     let status_str: String = row.get(15)?;
     let status = CommitmentStatus::from_str(&status_str)
         .unwrap_or(CommitmentStatus::Confirmed);
+    let last_published_sequence: Option<i64> = row.get(16)?;
     Ok(Commitment {
         id: row.get(0)?,
         uid: row.get(1)?,
@@ -148,6 +182,7 @@ fn row_to_commitment_no_attendees(
         attendees: Vec::new(),
         source,
         status,
+        last_published_sequence: last_published_sequence.map(|n| n as u32),
         source_message_id: row.get(12)?,
         created_at: parse_utc(&created_at),
         updated_at: parse_utc(&updated_at),
@@ -197,23 +232,25 @@ pub fn upsert_commitment(
             (id, uid, sequence, summary, description, location,
              start_at, end_at, original_tzid,
              organizer_email, organizer_name,
-             source, source_message_id, created_at, updated_at, status)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+             source, source_message_id, created_at, updated_at, status,
+             last_published_sequence)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
          ON CONFLICT(id) DO UPDATE SET
-            uid               = excluded.uid,
-            sequence          = excluded.sequence,
-            summary           = excluded.summary,
-            description       = excluded.description,
-            location          = excluded.location,
-            start_at          = excluded.start_at,
-            end_at            = excluded.end_at,
-            original_tzid     = excluded.original_tzid,
-            organizer_email   = excluded.organizer_email,
-            organizer_name    = excluded.organizer_name,
-            source            = excluded.source,
-            source_message_id = excluded.source_message_id,
-            updated_at        = excluded.updated_at,
-            status            = excluded.status",
+            uid                     = excluded.uid,
+            sequence                = excluded.sequence,
+            summary                 = excluded.summary,
+            description             = excluded.description,
+            location                = excluded.location,
+            start_at                = excluded.start_at,
+            end_at                  = excluded.end_at,
+            original_tzid           = excluded.original_tzid,
+            organizer_email         = excluded.organizer_email,
+            organizer_name          = excluded.organizer_name,
+            source                  = excluded.source,
+            source_message_id       = excluded.source_message_id,
+            updated_at              = excluded.updated_at,
+            status                  = excluded.status,
+            last_published_sequence = excluded.last_published_sequence",
         params![
             target_id,
             commitment.uid,
@@ -231,6 +268,7 @@ pub fn upsert_commitment(
             commitment.created_at.to_rfc3339(),
             commitment.updated_at.to_rfc3339(),
             commitment.status.as_str(),
+            commitment.last_published_sequence.map(|n| n as i64),
         ],
     )?;
 

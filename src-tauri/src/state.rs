@@ -117,6 +117,88 @@ impl Default for WorkflowConfig {
     }
 }
 
+/// Phase-2 calendar IMAP sync configuration. When `enabled` is `false`
+/// (the default), the calendar lives only in SQLite — Phase-1 behavior.
+/// When the user opts in via Settings and picks an `account_id`, the
+/// "Sync"-Action in the Calendar view starts publishing/reading the
+/// configured `folder_path` on that account per ADR-0011.
+///
+/// `folder_path` is the raw IMAP path the server expects. The default
+/// uses the conventional `/` delimiter; servers using `.` (Cyrus-style)
+/// require the user to set the override (e.g. `INBOX.TimeProtocol.Calendar`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CalendarConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub account_id: Option<AccountId>,
+    #[serde(default = "default_folder_path")]
+    pub folder_path: String,
+    /// Interval (seconds) for the background periodic-sync task. Floor
+    /// is 60 s — anything shorter is mostly self-DOSing the IMAP server
+    /// without changing user-perceived latency. Default 300 s (5 min).
+    /// Set this to 0 to disable periodic sync entirely (manual + IDLE
+    /// + sync-on-mutation still run).
+    #[serde(default = "default_auto_sync_interval")]
+    pub auto_sync_interval_seconds: u64,
+    /// When true, the IMAP-IDLE actor opens a long-lived session against
+    /// the calendar folder and triggers a sync whenever the server
+    /// notifies of a change. Cheaper than aggressive polling for
+    /// typical home-server / Dovecot deployments. Default true.
+    #[serde(default = "default_idle_enabled")]
+    pub idle_enabled: bool,
+    /// When true, every mutation (create/update/cancel/import) fires a
+    /// fire-and-forget background publish so the user doesn't have to
+    /// click Sync after every edit. Default true. Errors land in the
+    /// dev console; the next periodic / IDLE-triggered sync catches
+    /// up automatically.
+    #[serde(default = "default_sync_on_mutation")]
+    pub sync_on_mutation: bool,
+    /// When true, every successful sync runs a compaction pass that
+    /// moves superseded ICS messages to `<folder>/Archive`. Default
+    /// true — keeps active folders bounded for typical multi-year
+    /// usage. ADR-0011 §6 makes compaction OPTIONAL and the Archive
+    /// folder OPTIONAL; readers that ignore Archive still reconstruct
+    /// state correctly.
+    #[serde(default = "default_compaction_enabled")]
+    pub compaction_enabled: bool,
+}
+
+fn default_folder_path() -> String {
+    "INBOX/TimeProtocol/Calendar".to_string()
+}
+
+fn default_auto_sync_interval() -> u64 {
+    300
+}
+
+fn default_idle_enabled() -> bool {
+    true
+}
+
+fn default_sync_on_mutation() -> bool {
+    true
+}
+
+fn default_compaction_enabled() -> bool {
+    true
+}
+
+impl Default for CalendarConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            account_id: None,
+            folder_path: default_folder_path(),
+            auto_sync_interval_seconds: default_auto_sync_interval(),
+            idle_enabled: default_idle_enabled(),
+            sync_on_mutation: default_sync_on_mutation(),
+            compaction_enabled: default_compaction_enabled(),
+        }
+    }
+}
+
 pub struct AppState {
     pub pi_config: std::sync::Mutex<PiConfig>,
     /// Persistent pi RPC process; spawned on first AI request.
@@ -146,6 +228,25 @@ pub struct AppState {
     /// Workflow engine configuration (script dir + interpreter). Hydrated
     /// from disk at startup via `commands::workflows::load_persisted`.
     pub workflow_config: std::sync::Mutex<WorkflowConfig>,
+    /// Phase-2 calendar IMAP sync configuration. Hydrated at startup via
+    /// `timeprotocol::commands::load_persisted_calendar_config`.
+    pub calendar_config: std::sync::Mutex<CalendarConfig>,
+    /// Single-flight gate for all calendar sync trigger sources (manual
+    /// button, periodic timer, IDLE actor, sync-on-mutation). Holding
+    /// this lock guarantees only one sync runs at a time, so concurrent
+    /// triggers don't race against each other publishing or importing
+    /// the same UIDs. Tokio Mutex (async-aware) so a periodic-tick
+    /// trigger waiting for an in-flight manual sync doesn't block the
+    /// runtime.
+    pub calendar_sync_lock: Mutex<()>,
+    /// Optional command channel to the live IMAP-IDLE calendar actor.
+    /// Set when an actor task is currently running (config enabled +
+    /// idle_enabled + account selected). `cal_set_config` sends a
+    /// `Reload` message through here so the actor restarts against the
+    /// new account/folder; `None` after shutdown.
+    pub calendar_actor_tx: Mutex<
+        Option<tokio::sync::mpsc::Sender<crate::application::calendar_actor::ActorCmd>>,
+    >,
     /// Twin of `active_spam_pi` for the workflow-rule trainer.
     /// Separate so a spam-analysis run in flight doesn't block the
     /// user from training a workflow rule (they're independent
@@ -181,6 +282,9 @@ impl Default for AppState {
             active_spam_pi: Mutex::new(None),
             spam_cancel_requested: AtomicBool::new(false),
             workflow_config: std::sync::Mutex::new(WorkflowConfig::default()),
+            calendar_config: std::sync::Mutex::new(CalendarConfig::default()),
+            calendar_sync_lock: Mutex::new(()),
+            calendar_actor_tx: Mutex::new(None),
             active_workflow_training_pi: Mutex::new(None),
             workflow_training_cancel_requested: AtomicBool::new(false),
             actor_handles: Mutex::new(HashMap::new()),

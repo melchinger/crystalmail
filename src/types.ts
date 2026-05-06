@@ -512,6 +512,52 @@ export type ExportedIcs = {
   writtenTo: string | null;
 };
 
+// ─── Phase 2: IMAP-Folder-Sync per ADR-0011 ──────────────────────────────
+
+/** Calendar IMAP-sync configuration. `enabled === false` keeps the
+ *  calendar in Phase-1 local-only mode. When enabled, `accountId` is
+ *  required; the sync command refuses without it. */
+export type CalendarConfig = {
+  enabled: boolean;
+  accountId: string | null;
+  /** Raw IMAP path. Default `INBOX/TimeProtocol/Calendar`. Cyrus-style
+   *  servers using `.` as the hierarchy delimiter need an override
+   *  (e.g. `INBOX.TimeProtocol.Calendar`) per ADR-0011 §2 — but doing so
+   *  forfeits cross-implementation interop guarantees. */
+  folderPath: string;
+  /** Background-task interval in seconds. Floor 60. 0 = disabled (only
+   *  manual / IDLE / mutation triggers run). Default 300 (5 min). */
+  autoSyncIntervalSeconds: number;
+  /** Long-lived IMAP-IDLE session that triggers a sync on every server
+   *  push notification. Lower latency than polling for typical home
+   *  servers; pull cost = one persistent IMAP slot. Default true. */
+  idleEnabled: boolean;
+  /** Fire a fire-and-forget background publish after every local CRUD
+   *  so the user doesn't have to click Sync after every edit. Default
+   *  true. */
+  syncOnMutation: boolean;
+  /** Run a compaction pass after every successful sync that moves
+   *  superseded ICS messages into `<folder>/Archive`. Default true. */
+  compactionEnabled: boolean;
+};
+
+/** Result of `cal_sync_imap`. Surfaced to the UI so the sync button can
+ *  show "X imported, Y published, Z unchanged" without re-fetching.
+ *  Distinct from the mail-side `SyncReport` (folder/fetched/stored). */
+export type CalendarSyncReport = {
+  imported: number;
+  published: number;
+  unchanged: number;
+  /** Number of superseded ICS messages moved to `<folder>/Archive`
+   *  during the post-sync compaction pass. 0 when compaction is off. */
+  compacted: number;
+  /** UIDs detected as server-side hard-deleted (present in our local
+   *  state at last sync, gone now, no local mutation since). Marked
+   *  STATUS:CANCELLED locally; not republished. */
+  remoteDeleted: number;
+  errors: string[];
+};
+
 export type MessageDetail = {
   envelope: EnvelopeDetail;
   plainText: string | null;

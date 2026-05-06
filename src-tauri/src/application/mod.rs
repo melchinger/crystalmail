@@ -3,6 +3,8 @@ pub mod actor;
 pub mod attachments;
 pub mod backup;
 pub mod body;
+pub mod calendar_actor;
+pub mod calendar_imap;
 pub mod contact_extract;
 pub mod contacts_io;
 pub mod draft_import;

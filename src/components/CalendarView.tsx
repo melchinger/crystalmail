@@ -8,7 +8,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
-import type { Commitment } from "../types";
+import type { CalendarSyncReport, Commitment } from "../types";
 import { EventEditor } from "./EventEditor";
 
 type EditorState =
@@ -24,6 +24,8 @@ export function CalendarView() {
   const [error, setError] = useState<string | null>(null);
   const [editor, setEditor] = useState<EditorState>(null);
   const [showPast, setShowPast] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const [syncStatus, setSyncStatus] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -52,6 +54,36 @@ export function CalendarView() {
     void refresh();
   }, [refresh]);
 
+  const handleSync = useCallback(async () => {
+    if (syncing) return;
+    setSyncing(true);
+    setSyncStatus(null);
+    try {
+      const report = await invoke<CalendarSyncReport>("cal_sync_imap");
+      const errCount = report.errors.length;
+      setSyncStatus(
+        t("calendar.list.syncDone", {
+          imported: report.imported,
+          published: report.published,
+          remoteDeleted: report.remoteDeleted,
+          errors: errCount,
+        }),
+      );
+      // Refresh the list after sync — imports may have added new rows.
+      await refresh();
+      // Surface per-event errors in the dev console; the user gets the
+      // count in the status line above.
+      if (errCount > 0) {
+        // eslint-disable-next-line no-console
+        console.warn("calendar sync errors:", report.errors);
+      }
+    } catch (e) {
+      setSyncStatus(`✗ ${String(e)}`);
+    } finally {
+      setSyncing(false);
+    }
+  }, [refresh, syncing, t]);
+
   const grouped = useMemo(() => groupByBucket(events ?? []), [events]);
 
   return (
@@ -70,6 +102,28 @@ export function CalendarView() {
           {events?.length ?? 0} {t("calendar.list.eventsCount")}
         </span>
         <div className="ml-auto flex items-center gap-2">
+          {syncStatus && (
+            <span
+              className="text-xs"
+              style={{ color: "var(--fg-subtle)" }}
+            >
+              {syncStatus}
+            </span>
+          )}
+          <button
+            type="button"
+            onClick={() => void handleSync()}
+            disabled={syncing}
+            className="rounded px-3 py-1 text-xs"
+            style={{
+              background: "var(--bg-soft)",
+              color: "var(--fg-base)",
+              border: "1px solid var(--border-soft)",
+            }}
+            title={t("calendar.list.syncTitle")}
+          >
+            {syncing ? t("calendar.list.syncing") : t("calendar.list.sync")}
+          </button>
           <label
             className="flex items-center gap-1 text-xs"
             style={{ color: "var(--fg-muted)" }}

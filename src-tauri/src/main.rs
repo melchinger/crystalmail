@@ -214,6 +214,37 @@ fn main() {
                 }
             });
 
+            // Same pattern for the Phase-2 calendar IMAP-sync config.
+            // Default = disabled, so missing file leaves the calendar
+            // in Phase-1 (local-only) behavior. After hydrating, kick
+            // off the Phase-2.5 background machinery: a periodic-sync
+            // tokio task (cheap to spawn, re-reads config every tick)
+            // and the IDLE actor lifecycle reconciler (no-op when
+            // disabled).
+            let cal_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                if let Some(persisted) =
+                    timeprotocol::commands::load_persisted(&cal_handle)
+                {
+                    let state = cal_handle.state::<state::AppState>();
+                    let lock_result = state.calendar_config.lock();
+                    if let Ok(mut guard) = lock_result {
+                        *guard = persisted;
+                        tracing::info!("calendar_config restored from disk");
+                    }
+                }
+                // Periodic auto-sync: a single long-lived tokio task
+                // that wakes up every `auto_sync_interval_seconds` and
+                // checks if a sync should run. Internally re-reads the
+                // current config so live toggles take effect from the
+                // next tick.
+                timeprotocol::sync::spawn_periodic_task(cal_handle.clone());
+                // IDLE actor: spawned when (and only when) the config
+                // says enabled + idle_enabled + account_id. No-op
+                // otherwise.
+                application::calendar_actor::reconcile(&cal_handle).await;
+            });
+
             // Cold-Start-Argv: wurde die App vom OS direkt mit einem
             // `--draft-from-template`-Trigger gestartet (z.B. weil der
             // User aus einem Python-Script heraus `crystalmail.exe …`
@@ -344,6 +375,9 @@ fn main() {
             timeprotocol::commands::cal_delete,
             timeprotocol::commands::cal_import_ics_attachment,
             timeprotocol::commands::cal_export_to_ics,
+            timeprotocol::commands::cal_get_config,
+            timeprotocol::commands::cal_set_config,
+            timeprotocol::commands::cal_sync_imap,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
