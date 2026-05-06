@@ -347,6 +347,19 @@ pub enum WriteCmd {
         tag_ids: Vec<crate::domain::contact::TagId>,
         ack: oneshot::Sender<Result<(), DbError>>,
     },
+    /// Phase-1 calendar writes. SQL implementation lives in
+    /// `crate::timeprotocol::store` rather than `db_ops` so the calendar
+    /// bounded context owns its own persistence — see the architecture
+    /// note in `timeprotocol/mod.rs`.
+    ///
+    /// Cancellation is also dispatched as `UpsertCommitment` — per
+    /// ADR-0011 §3 / Variante B, a cancellation is a normal mutation
+    /// that bumps SEQUENCE and sets STATUS:CANCELLED. Hard delete
+    /// (purge) is intentionally not exposed in Phase 1.
+    UpsertCommitment {
+        commitment: crate::timeprotocol::domain::Commitment,
+        ack: oneshot::Sender<Result<(), DbError>>,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -851,6 +864,12 @@ fn dispatch(conn: &mut Connection, cmd: WriteCmd) {
             ack,
         } => {
             let _ = ack.send(replace_contact_tags(conn, &contact_id, &tag_ids));
+        }
+        WriteCmd::UpsertCommitment { commitment, ack } => {
+            let _ = ack.send(crate::timeprotocol::store::upsert_commitment(
+                conn,
+                &commitment,
+            ));
         }
     }
 }

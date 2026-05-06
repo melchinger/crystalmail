@@ -33,6 +33,8 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/0024_lifetime_rules.sql"),
     include_str!("../../migrations/0025_unify_filters_into_workflow_rules.sql"),
     include_str!("../../migrations/0026_delay_minutes.sql"),
+    include_str!("../../migrations/0027_commitments.sql"),
+    include_str!("../../migrations/0028_commitment_status.sql"),
 ];
 
 pub fn apply(conn: &mut Connection) -> Result<(), DbError> {

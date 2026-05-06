@@ -1,16 +1,37 @@
-// iCalendar parsing + REPLY building for invitation-handling.
+// iCalendar parsing + REPLY/REQUEST building.
 //
-// Parser is the third-party `ical` crate. The reply builder is hand-rolled —
-// the REPLY shape is small and well-defined, and writing it ourselves avoids
-// pulling another writer dependency just to emit ~12 lines of CRLF text.
+// Parser is the third-party `ical` crate. Builders (REPLY for invitation
+// responses; REQUEST for export-as-ICS of a stored commitment) are
+// hand-rolled — the shapes are small and well-defined, and writing them
+// ourselves avoids pulling another writer dependency.
+//
+// Time-zone handling for Phase 1 (per project memory):
+//   * `Z` suffix    → UTC offset
+//   * TZID present  → ignore the TZID name, treat the wall clock as local
+//                     and apply the system's current local offset. This is
+//                     wrong for events spanning DST transitions, but it's
+//                     the documented Phase 1 limitation; full IANA-zone
+//                     resolution lands later (probably with chrono-tz).
+//   * no suffix     → same as TZID — local wall clock, local offset
 
 use std::io::Cursor;
 
-use chrono::Utc;
+use chrono::{FixedOffset, Local, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use ical::parser::ical::component::IcalEvent;
 use ical::IcalParser;
+use uuid::Uuid;
 
-use crate::domain::calendar::{IcsParticipant, InvitationResponse, ParsedIcsEvent};
+use super::domain::{
+    Commitment, CommitmentAttendee, CommitmentSource, CommitmentStatus,
+    IcsParticipant, InvitationResponse, ParsedIcsEvent,
+};
+
+/// PRODID emitted in every CrystalMail-built VCALENDAR. Convention is
+/// `-//<org>//<product><version>//EN`. Bumping the version segment as
+/// the calendar feature evolves makes downstream-debugging easier and
+/// gives the iMIP-receiver-side a hint about which builder produced the
+/// payload.
+const PRODID: &str = "-//CrystalMail//Calendar 1.0//EN";
 
 /// Parse the first VEVENT out of an iCalendar byte stream. Returns `Ok(None)`
 /// when the input is well-formed iCalendar but contains no events (e.g. an
@@ -134,7 +155,7 @@ pub fn build_reply(
     let mut out = String::new();
     push_line(&mut out, "BEGIN:VCALENDAR");
     push_line(&mut out, "VERSION:2.0");
-    push_line(&mut out, "PRODID:-//CrystalMail//Calendar Phase 0//EN");
+    push_line(&mut out, &format!("PRODID:{PRODID}"));
     push_line(&mut out, "METHOD:REPLY");
     push_line(&mut out, "BEGIN:VEVENT");
 
@@ -261,6 +282,251 @@ fn escape_param(s: &str) -> String {
     } else {
         stripped
     }
+}
+
+// ─── Phase 1: ICS ↔ Commitment conversion ────────────────────────────────
+
+/// Convert a parsed ICS event into a stored Commitment. Used by the import
+/// path (Annehmen + manual import). The caller passes the originating
+/// message id (so we can deep-link "view source") and optionally our own
+/// PARTSTAT — when set, we mark our attendee row with that response.
+pub fn ics_to_commitment(
+    parsed: &ParsedIcsEvent,
+    source_message_id: Option<String>,
+    my_email: Option<&str>,
+    my_partstat: Option<InvitationResponse>,
+) -> Result<Commitment, String> {
+    let dtstart = parsed
+        .dtstart
+        .as_deref()
+        .ok_or("ICS event has no DTSTART")?;
+    let dtend = parsed
+        .dtend
+        .as_deref()
+        .ok_or("ICS event has no DTEND")?;
+
+    let (start_at, original_tzid) = ics_time_to_rfc3339(dtstart)?;
+    let (end_at, _) = ics_time_to_rfc3339(dtend)?;
+
+    // Mirror the ICS attendee list, stamping our PARTSTAT in place if the
+    // caller told us we just responded. We match by email lowercase.
+    let lowered = my_email.map(|s| s.to_ascii_lowercase());
+    let my_partstat_str = my_partstat.map(|r| r.partstat().to_string());
+    let attendees = parsed
+        .attendees
+        .iter()
+        .map(|a| {
+            let is_me = lowered
+                .as_deref()
+                .map(|m| a.email.eq_ignore_ascii_case(m))
+                .unwrap_or(false);
+            CommitmentAttendee {
+                email: a.email.clone(),
+                display_name: a.display_name.clone(),
+                partstat: if is_me {
+                    my_partstat_str.clone()
+                } else {
+                    None
+                },
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let now = Utc::now();
+    Ok(Commitment {
+        id: Uuid::new_v4().to_string(),
+        uid: parsed.uid.clone(),
+        sequence: parsed.sequence,
+        summary: parsed.summary.clone(),
+        description: parsed.description.clone(),
+        location: parsed.location.clone(),
+        start_at,
+        end_at,
+        original_tzid,
+        organizer: parsed.organizer.clone(),
+        attendees,
+        source: CommitmentSource::IcsImport,
+        // Imports start as confirmed unless the original ICS carried a
+        // STATUS:CANCELLED — Phase 1 ICS parsing doesn't surface STATUS
+        // yet; when it does, route through here.
+        status: CommitmentStatus::Confirmed,
+        source_message_id,
+        created_at: now,
+        updated_at: now,
+    })
+}
+
+/// Build a fresh Commitment from a manual-create form. UID gets a freshly
+/// minted UUID so the event can later be exported as ICS without collision.
+pub fn manual_commitment(
+    summary: Option<String>,
+    description: Option<String>,
+    location: Option<String>,
+    start_at: String,
+    end_at: String,
+    organizer: Option<IcsParticipant>,
+    attendees: Vec<CommitmentAttendee>,
+) -> Commitment {
+    let now = Utc::now();
+    Commitment {
+        id: Uuid::new_v4().to_string(),
+        uid: format!("{}@crystalmail", Uuid::new_v4()),
+        sequence: 0,
+        summary,
+        description,
+        location,
+        start_at,
+        end_at,
+        original_tzid: None,
+        organizer,
+        attendees,
+        source: CommitmentSource::Manual,
+        status: CommitmentStatus::Confirmed,
+        source_message_id: None,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+/// Build a REQUEST-flavored ICS for a stored commitment. Used by the
+/// "export this event" path so the user can share it with non-CrystalMail
+/// peers as a plain `.ics` file or attach it manually to a mail.
+///
+/// Re-uses the line-folding + escape helpers already used by `build_reply`.
+pub fn build_ics_for_commitment(c: &Commitment) -> String {
+    let mut out = String::new();
+    push_line(&mut out, "BEGIN:VCALENDAR");
+    push_line(&mut out, "VERSION:2.0");
+    push_line(&mut out, &format!("PRODID:{PRODID}"));
+    // ADR-0011 §3 mandates METHOD:PUBLISH for the IMAP carriage profile.
+    // Same VCALENDAR shape works for the user-driven export-as-file path
+    // (Phase 1) and the future IMAP-folder publish path (Phase 2) — keeps
+    // the builder single-purposed.
+    push_line(&mut out, "METHOD:PUBLISH");
+    push_line(&mut out, "BEGIN:VEVENT");
+
+    push_folded(&mut out, &format!("UID:{}", escape_text(&c.uid)));
+    push_line(&mut out, &format!("SEQUENCE:{}", c.sequence));
+    push_line(
+        &mut out,
+        &format!("DTSTAMP:{}", Utc::now().format("%Y%m%dT%H%M%SZ")),
+    );
+
+    push_folded(&mut out, &format!("DTSTART:{}", rfc3339_to_ics(&c.start_at)));
+    push_folded(&mut out, &format!("DTEND:{}", rfc3339_to_ics(&c.end_at)));
+
+    if let Some(s) = &c.summary {
+        push_folded(&mut out, &format!("SUMMARY:{}", escape_text(s)));
+    }
+    if let Some(d) = &c.description {
+        push_folded(&mut out, &format!("DESCRIPTION:{}", escape_text(d)));
+    }
+    if let Some(l) = &c.location {
+        push_folded(&mut out, &format!("LOCATION:{}", escape_text(l)));
+    }
+    if let Some(org) = &c.organizer {
+        push_folded(&mut out, &organizer_line(org));
+    }
+    for a in &c.attendees {
+        push_folded(&mut out, &commitment_attendee_line(a));
+    }
+    // STATUS is SHOULD-level per ADR-0011 §3 but always informative.
+    // Required for cancellation round-trip into IMAP (Phase 2).
+    push_line(&mut out, &format!("STATUS:{}", c.status.as_str()));
+
+    push_line(&mut out, "END:VEVENT");
+    push_line(&mut out, "END:VCALENDAR");
+    out
+}
+
+fn commitment_attendee_line(a: &CommitmentAttendee) -> String {
+    let cn = a.display_name.as_deref().filter(|s| !s.is_empty());
+    let partstat = a
+        .partstat
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("NEEDS-ACTION");
+    match cn {
+        Some(name) => format!(
+            "ATTENDEE;CN={};PARTSTAT={}:mailto:{}",
+            escape_param(name),
+            partstat,
+            a.email,
+        ),
+        None => format!(
+            "ATTENDEE;PARTSTAT={}:mailto:{}",
+            partstat, a.email,
+        ),
+    }
+}
+
+/// Parse one of the four ICS time shapes into an RFC 3339 string with an
+/// explicit offset, plus the original TZID (if any) for round-trip export.
+///
+/// Shapes:
+///   `19970714T133000Z`              → UTC
+///   `19970714T133000`               → floating, treated as system-local
+///   `TZID=Europe/Berlin:19970714T133000` → local (TZID name kept for export)
+///   `19970714`                      → date only, midnight system-local
+fn ics_time_to_rfc3339(raw: &str) -> Result<(String, Option<String>), String> {
+    let trimmed = raw.trim();
+    let (tzid, body) = if let Some(rest) = trimmed.strip_prefix("TZID=") {
+        match rest.split_once(':') {
+            Some((tz, t)) => (Some(tz.to_string()), t),
+            None => return Err(format!("malformed TZID expression: {trimmed}")),
+        }
+    } else {
+        (None, trimmed)
+    };
+
+    if body.len() == 8 {
+        // Date-only.
+        let date = NaiveDate::parse_from_str(body, "%Y%m%d")
+            .map_err(|e| format!("invalid date {body}: {e}"))?;
+        let naive = date.and_hms_opt(0, 0, 0).unwrap();
+        let offset = Local.offset_from_local_datetime(&naive).single().ok_or(
+            "ambiguous local time at midnight near a DST transition",
+        )?;
+        let dt = offset.from_local_datetime(&naive).single().ok_or(
+            "ambiguous local time at midnight near a DST transition",
+        )?;
+        return Ok((dt.to_rfc3339(), tzid));
+    }
+
+    let (stripped, is_utc) = match body.strip_suffix('Z') {
+        Some(s) => (s, true),
+        None => (body, false),
+    };
+    let naive = NaiveDateTime::parse_from_str(stripped, "%Y%m%dT%H%M%S")
+        .map_err(|e| format!("invalid datetime {body}: {e}"))?;
+
+    let dt_with_offset = if is_utc {
+        Utc.from_utc_datetime(&naive)
+            .with_timezone(&FixedOffset::east_opt(0).unwrap())
+    } else {
+        // TZID present or floating: use local offset. See the Phase 1
+        // limitation noted at the top of this file.
+        let offset = Local
+            .offset_from_local_datetime(&naive)
+            .single()
+            .ok_or("ambiguous local time near a DST transition")?;
+        offset
+            .from_local_datetime(&naive)
+            .single()
+            .ok_or("ambiguous local time near a DST transition")?
+    };
+    Ok((dt_with_offset.to_rfc3339(), tzid))
+}
+
+/// Inverse of `ics_time_to_rfc3339`: turn our stored RFC 3339 timestamp
+/// back into an ICS DTSTART/DTEND value. We always emit UTC form
+/// (`YYYYMMDDTHHMMSSZ`) — lossy versus original_tzid, but unambiguous and
+/// accepted by every calendar consumer. Round-tripping the original TZID
+/// is a Phase-2+ concern.
+fn rfc3339_to_ics(rfc: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(rfc)
+        .map(|dt| dt.with_timezone(&Utc).format("%Y%m%dT%H%M%SZ").to_string())
+        .unwrap_or_else(|_| rfc.to_string())
 }
 
 #[cfg(test)]

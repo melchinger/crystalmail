@@ -6,6 +6,7 @@ mod domain;
 mod infrastructure;
 mod llm;
 mod state;
+mod timeprotocol;
 
 use tauri::{Emitter, Manager};
 use tracing_subscriber::EnvFilter;
@@ -334,8 +335,15 @@ fn main() {
             commands::workflows::list_rule_action_log,
             commands::draft_import::prepare_draft_from_template,
             commands::draft_import::consume_pending_import_drafts,
-            commands::calendar::ics_parse_attachment,
-            commands::calendar::ics_build_invitation_reply,
+            timeprotocol::commands::ics_parse_attachment,
+            timeprotocol::commands::ics_build_invitation_reply,
+            timeprotocol::commands::cal_list_in_range,
+            timeprotocol::commands::cal_get,
+            timeprotocol::commands::cal_create,
+            timeprotocol::commands::cal_update,
+            timeprotocol::commands::cal_delete,
+            timeprotocol::commands::cal_import_ics_attachment,
+            timeprotocol::commands::cal_export_to_ics,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")

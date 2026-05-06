@@ -1,6 +1,5 @@
 pub mod accounts;
 pub mod backup;
-pub mod calendar;
 pub mod contacts;
 pub mod draft_import;
 pub mod folders;

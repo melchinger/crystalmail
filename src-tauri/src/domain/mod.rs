@@ -1,6 +1,5 @@
 pub mod account;
 pub mod auth;
-pub mod calendar;
 pub mod contact;
 pub mod folder;
 pub mod message;

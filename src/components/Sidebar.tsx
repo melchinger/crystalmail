@@ -7,6 +7,7 @@ import type { AccountSummary, FolderSummary, SyncProgress } from "../types";
 import { HoverTip } from "./HoverTip";
 import {
   IconArchive,
+  IconCalendar,
   IconCompose,
   IconContacts,
   IconDrafts,
@@ -23,6 +24,7 @@ type FolderKey =
   | "unified"
   | "starred"
   | "contacts"
+  | "calendar"
   | "archive"
   | "drafts"
   | "sent"
@@ -71,6 +73,7 @@ const FOLDERS: { key: FolderKey; Icon: FC<{ size?: number }> }[] = [
   { key: "unified", Icon: IconInbox },
   { key: "starred", Icon: IconStarred },
   { key: "contacts", Icon: IconContacts },
+  { key: "calendar", Icon: IconCalendar },
   { key: "archive", Icon: IconArchive },
   { key: "drafts", Icon: IconDrafts },
   { key: "sent", Icon: IconSent },
