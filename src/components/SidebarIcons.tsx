@@ -135,6 +135,17 @@ export const IconContacts = (p: { size?: number }) => (
   </Svg>
 );
 
+export const IconCalendar = (p: { size?: number }) => (
+  <Svg size={p.size}>
+    {/* Calendar body + tear-off ring at the top, pre-styled to match
+        the other icons' stroke-only aesthetic. */}
+    <rect x="3" y="5" width="18" height="16" rx="2" />
+    <line x1="3" y1="10" x2="21" y2="10" />
+    <line x1="8" y1="3" x2="8" y2="7" />
+    <line x1="16" y1="3" x2="16" y2="7" />
+  </Svg>
+);
+
 export const IconSettings = (p: { size?: number }) => (
   <Svg size={p.size}>
     <path d="M19.14 12.94a7.07 7.07 0 0 0 .06-.94 7.07 7.07 0 0 0-.06-.94l2.03-1.58a.5.5 0 0 0 .12-.64l-1.92-3.32a.5.5 0 0 0-.61-.22l-2.39.96a7 7 0 0 0-1.62-.94l-.36-2.54a.5.5 0 0 0-.5-.42h-3.84a.5.5 0 0 0-.5.42l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96a.5.5 0 0 0-.61.22L2.74 8.84a.5.5 0 0 0 .12.64l2.03 1.58c-.04.31-.06.62-.06.94s.02.63.06.94l-2.03 1.58a.5.5 0 0 0-.12.64l1.92 3.32c.14.24.43.33.67.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.25.42.5.42h3.84a.5.5 0 0 0 .5-.42l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.24.11.53.02.67-.22l1.92-3.32a.5.5 0 0 0-.12-.64l-2.03-1.58Z" />

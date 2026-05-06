@@ -22,6 +22,7 @@ import {
   splitAddresses,
   type ComposeSendSnapshot,
 } from "./components/Compose";
+import { CalendarView } from "./components/CalendarView";
 import { ContactsView } from "./components/ContactsView";
 import { ContactDetail } from "./components/ContactDetail";
 import { UndoSendOverlay } from "./components/UndoSendOverlay";
@@ -64,6 +65,7 @@ type FolderKey =
   | "unified"
   | "starred"
   | "contacts"
+  | "calendar"
   | "archive"
   | "drafts"
   | "sent"
@@ -1749,6 +1751,10 @@ export function App() {
         // Priority-Folder.
         case "contacts":
           return null;
+        // "calendar" ist ebenfalls client-derived (lokaler Store, Phase 1).
+        // Kein IMAP-Sync hängt am Calendar-View.
+        case "calendar":
+          return null;
       }
     };
     try {
@@ -1877,7 +1883,11 @@ export function App() {
           onSelectFolder={setSelectedFolder}
           unreadCounts={unreadCounts}
         />
-        {activeFolder === "contacts" ? (
+        {activeFolder === "calendar" ? (
+          <div className="min-h-0 flex-1">
+            <CalendarView />
+          </div>
+        ) : activeFolder === "contacts" ? (
           <>
             <div
               className="flex w-[22.5rem] shrink-0 flex-col border-r"

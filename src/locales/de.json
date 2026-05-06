@@ -7,6 +7,7 @@
     "unified": "Alle Postfächer",
     "starred": "Markiert",
     "contacts": "Kontakte",
+    "calendar": "Kalender",
     "archive": "Archiv",
     "drafts": "Entwürfe",
     "sent": "Gesendet",
@@ -155,6 +156,7 @@
     "saveTooltip": "Speichern unter …"
   },
   "calendar": {
+    "sidebar": "Kalender",
     "invitation": {
       "label": "Termineinladung",
       "untitled": "(ohne Titel)",
@@ -174,6 +176,41 @@
         "tentative": "Ich habe die Einladung „{{summary}}\" mit Vorbehalt angenommen.",
         "declined": "Ich habe die Einladung „{{summary}}\" abgelehnt."
       }
+    },
+    "list": {
+      "title": "Kalender",
+      "loading": "Lade Termine …",
+      "newEvent": "Neuer Termin",
+      "showPast": "Vergangene anzeigen",
+      "eventsCount": "Termine",
+      "bucket": {
+        "past": "Vergangen",
+        "today": "Heute",
+        "todayEmpty": "Heute keine Termine.",
+        "thisWeek": "Diese Woche",
+        "later": "Später"
+      }
+    },
+    "editor": {
+      "createTitle": "Neuer Termin",
+      "editTitle": "Termin bearbeiten",
+      "summary": "Titel",
+      "start": "Beginn",
+      "end": "Ende",
+      "location": "Ort",
+      "description": "Notiz",
+      "save": "Speichern",
+      "saving": "Speichert …",
+      "cancel": "Abbrechen",
+      "delete": "Absagen",
+      "confirmDelete": "Termin absagen? (Verschwindet aus deiner Liste; bei späterem Sync wird die Absage propagiert.)",
+      "exportIcs": "Als ICS exportieren",
+      "exportTitle": "Termin exportieren als …",
+      "exportSavedTo": "Gespeichert: {{path}}",
+      "exportConsoleNotice": "ICS-Inhalt wurde in der Konsole abgelegt — Save-to-Disk landet in einer späteren Version.",
+      "missingTime": "Beginn und Ende müssen gesetzt sein.",
+      "endBeforeStart": "Das Ende liegt vor dem Beginn.",
+      "notFound": "Termin nicht gefunden."
     }
   },
   "compose": {

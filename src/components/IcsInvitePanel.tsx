@@ -107,6 +107,22 @@ export function IcsInvitePanel({
           attendeeName: account.fromName || null,
         },
       );
+      // Phase 1: also stash the event in the local calendar so the user
+      // sees it under "Heute / Diese Woche" without having to keep the
+      // mail around. We pass our PARTSTAT in so the stored row reflects
+      // the choice we just made. This is best-effort — a calendar-write
+      // failure must not block the response mail; the user already
+      // decided to send it. Errors land in the dev console for triage.
+      try {
+        await invoke("cal_import_ics_attachment", {
+          messageId,
+          partIdx: ics.partIdx,
+          myEmail: account.address,
+          myPartstat: response,
+        });
+      } catch (err) {
+        console.warn("calendar import on respond failed", err);
+      }
       onCompose(buildIcsReplyComposeDraft(reply, account, t));
     } catch (err) {
       console.error("ics reply build failed", err);

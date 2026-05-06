@@ -405,7 +405,7 @@ export type AttachmentMeta = {
   isInline: boolean;
 };
 
-// ─── Calendar — Phase 0 (read-only ICS handling, no local store yet) ──────
+// ─── Calendar (timeProtocol bounded context) ─────────────────────────────
 
 export type IcsParticipant = {
   email: string;
@@ -443,6 +443,73 @@ export type InvitationReplyDraft = {
   attachmentPath: string;
   attachmentFilename: string;
   attachmentSizeBytes: number;
+};
+
+// ─── Phase 1: locally stored commitments ─────────────────────────────────
+
+export type CommitmentSource = "manual" | "ics_import" | "negotiation";
+
+/** RFC 5545 STATUS values mirrored locally. ADR-0011 §3 mandates STATUS
+ *  on the wire; we mirror it on the row so cancellation can be a normal
+ *  mutation (SEQUENCE+1, status=CANCELLED) rather than a hard delete. */
+export type CommitmentStatus = "CONFIRMED" | "CANCELLED" | "TENTATIVE";
+
+export type CommitmentAttendee = {
+  email: string;
+  displayName: string | null;
+  /** RFC 5545 PARTSTAT (`ACCEPTED`, `DECLINED`, `TENTATIVE`, …). `null`
+   *  for attendees we have no status for (typically participants the
+   *  user manually added to a self-created event). */
+  partstat: string | null;
+};
+
+/** One stored commitment row. `id` is our local UUID, `uid` is the
+ *  RFC 5545 cross-system UID — they are intentionally distinct so a
+ *  re-import of the same invitation upserts in place without breaking
+ *  any UI selection state pointing at the local id. */
+export type Commitment = {
+  id: string;
+  uid: string;
+  sequence: number;
+  summary: string | null;
+  description: string | null;
+  location: string | null;
+  /** RFC 3339 with explicit offset, e.g. `2026-04-23T09:00:00+02:00`. */
+  startAt: string;
+  endAt: string;
+  /** Original RFC 5545 TZID, kept for ICS round-trip on export. */
+  originalTzid: string | null;
+  organizer: IcsParticipant | null;
+  attendees: CommitmentAttendee[];
+  source: CommitmentSource;
+  /** Lifecycle state. The list view filters CANCELLED out by default. */
+  status: CommitmentStatus;
+  /** When `source === "ics_import"`: the message the event was imported
+   *  from. Useful to deep-link "view source mail". */
+  sourceMessageId: string | null;
+  /** ISO 8601 UTC. */
+  createdAt: string;
+  updatedAt: string;
+};
+
+/** Form payload for create/update. UID, id, sequence, source, and timestamps
+ *  are managed by the backend; the form only carries user-editable fields. */
+export type CommitmentDraft = {
+  summary: string | null;
+  description: string | null;
+  location: string | null;
+  startAt: string;
+  endAt: string;
+  originalTzid: string | null;
+  organizer: IcsParticipant | null;
+  attendees: CommitmentAttendee[];
+};
+
+export type ExportedIcs = {
+  content: string;
+  filename: string;
+  /** Set when the export call also wrote the blob to a path on disk. */
+  writtenTo: string | null;
 };
 
 export type MessageDetail = {
