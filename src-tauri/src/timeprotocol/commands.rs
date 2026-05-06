@@ -13,6 +13,8 @@
 // directly — the inbound read of an ICS attachment is the only Mail-layer
 // access in this whole module.
 
+use std::path::PathBuf;
+
 use serde::Serialize;
 use tauri::{AppHandle, Manager};
 use tokio::sync::oneshot;
@@ -24,7 +26,96 @@ use super::{ics, store};
 use crate::application::attachments;
 use crate::domain::message::MessageId;
 use crate::infrastructure::db::WriteCmd;
-use crate::state::AppState;
+use crate::state::{AppState, CalendarConfig};
+
+// ─── Phase 2.1: persisted calendar IMAP-sync config ──────────────────────
+
+const CALENDAR_CONFIG_FILE: &str = "calendar_config.json";
+
+fn calendar_config_path(app: &AppHandle) -> Option<PathBuf> {
+    app.path()
+        .app_data_dir()
+        .ok()
+        .map(|d| d.join(CALENDAR_CONFIG_FILE))
+}
+
+/// Load the persisted calendar config from disk. Called from the Tauri
+/// `setup` hook in `main.rs`. Missing or unreadable file → defaults
+/// (sync disabled, Phase-1 fallback). Same shape as
+/// `commands::workflows::load_persisted` and `commands::pi::load_persisted`.
+pub fn load_persisted(app: &AppHandle) -> Option<CalendarConfig> {
+    let path = calendar_config_path(app)?;
+    let bytes = std::fs::read(&path).ok()?;
+    serde_json::from_slice::<CalendarConfig>(&bytes).ok()
+}
+
+fn save_persisted(app: &AppHandle, cfg: &CalendarConfig) -> Result<(), String> {
+    let path = calendar_config_path(app)
+        .ok_or_else(|| "app_data_dir nicht verfügbar".to_string())?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
+    }
+    let json = serde_json::to_vec_pretty(cfg).map_err(|e| format!("serialize: {e}"))?;
+    std::fs::write(&path, json).map_err(|e| format!("write: {e}"))
+}
+
+/// Read-side: the in-memory CalendarConfig. Frontend Settings panel uses
+/// this to populate the calendar tab.
+#[tauri::command]
+pub async fn cal_get_config(app: AppHandle) -> CalendarConfig {
+    let state = app.state::<AppState>();
+    let guard = state.calendar_config.lock().unwrap();
+    guard.clone()
+}
+
+/// Write-side: replace the in-memory config and persist to disk. After
+/// the swap, reconcile the IDLE actor — start/stop/restart it to match
+/// the new config (account or folder may have changed). Persist failures
+/// are logged but not surfaced — the in-memory write succeeded.
+#[tauri::command]
+pub async fn cal_set_config(
+    app: AppHandle,
+    config: CalendarConfig,
+) -> Result<(), String> {
+    {
+        let state = app.state::<AppState>();
+        let mut guard = state.calendar_config.lock().unwrap();
+        *guard = config.clone();
+    }
+    if let Err(e) = save_persisted(&app, &config) {
+        tracing::warn!(error = %e, "persisting calendar_config failed");
+    }
+    // Apply the config change to the running IDLE actor (if any). Done
+    // unconditionally because any field change (enabled, account_id,
+    // folder, idle_enabled) is a reason to restart the actor. The
+    // reconcile call is idempotent.
+    crate::application::calendar_actor::reconcile(&app).await;
+    Ok(())
+}
+
+/// Spawn a fire-and-forget background sync if the user has opted in to
+/// sync-on-mutation. Called by every successful local CRUD command so
+/// the user doesn't have to click the "Sync"-button after every edit.
+fn maybe_spawn_mutation_sync(app: &AppHandle, reason: &'static str) {
+    let state = app.state::<AppState>();
+    let should = {
+        let cfg = state.calendar_config.lock().unwrap();
+        cfg.enabled && cfg.sync_on_mutation && cfg.account_id.is_some()
+    };
+    if should {
+        super::sync::spawn_background_sync(app, reason);
+    }
+}
+
+/// One-shot IMAP sync per ADR-0011: ensure-folder, read remote, resolve
+/// LWW per UID, diff against local, publish/import as needed, then
+/// optionally compact superseded messages into `<folder>/Archive`.
+/// Wraps `super::sync::run_with_lock` so concurrent triggers (manual
+/// button, periodic timer, IDLE actor, sync-on-mutation) cannot race.
+#[tauri::command]
+pub async fn cal_sync_imap(app: AppHandle) -> Result<super::sync::SyncReport, String> {
+    super::sync::run_with_lock(&app).await
+}
 
 /// Parse a single `text/calendar` (or `application/ics`) attachment and
 /// return the first VEVENT in a UI-friendly shape. Returns `Ok(None)` when
@@ -225,6 +316,7 @@ pub async fn cal_create(
     rx.await
         .map_err(|_| "writer dropped ack".to_string())?
         .map_err(|e| format!("db upsert: {e}"))?;
+    maybe_spawn_mutation_sync(&app, "cal_create");
     Ok(commitment)
 }
 
@@ -274,6 +366,10 @@ pub async fn cal_update(
         } else {
             existing.status
         },
+        // Carry over — only sync sets last_published_sequence; user-driven
+        // edits leave it alone so the diff sees `sequence > last_published`
+        // and publishes the update on the next sync.
+        last_published_sequence: existing.last_published_sequence,
         source_message_id: existing.source_message_id,
         created_at: existing.created_at,
         updated_at: chrono::Utc::now(),
@@ -290,6 +386,7 @@ pub async fn cal_update(
     rx.await
         .map_err(|_| "writer dropped ack".to_string())?
         .map_err(|e| format!("db update: {e}"))?;
+    maybe_spawn_mutation_sync(&app, "cal_update");
     Ok(updated)
 }
 
@@ -341,6 +438,7 @@ pub async fn cal_delete(app: AppHandle, id: String) -> Result<Commitment, String
         attendees: existing.attendees,
         source: existing.source,
         status: CommitmentStatus::Cancelled,
+        last_published_sequence: existing.last_published_sequence,
         source_message_id: existing.source_message_id,
         created_at: existing.created_at,
         updated_at: chrono::Utc::now(),
@@ -357,6 +455,7 @@ pub async fn cal_delete(app: AppHandle, id: String) -> Result<Commitment, String
     rx.await
         .map_err(|_| "writer dropped ack".to_string())?
         .map_err(|e| format!("db cancel: {e}"))?;
+    maybe_spawn_mutation_sync(&app, "cal_delete");
     Ok(cancelled)
 }
 
@@ -405,6 +504,7 @@ pub async fn cal_import_ics_attachment(
     rx.await
         .map_err(|_| "writer dropped ack".to_string())?
         .map_err(|e| format!("db upsert: {e}"))?;
+    maybe_spawn_mutation_sync(&app, "cal_import_ics_attachment");
     Ok(commitment)
 }
 

@@ -43,6 +43,12 @@ pub struct ParsedIcsEvent {
     /// of the response buttons — a calendar broadcast (no attendees) cannot
     /// meaningfully be replied to.
     pub is_invitation: bool,
+    /// VEVENT STATUS, normalized to uppercase. ADR-0011 §3 requires this
+    /// field for the carriage profile (CONFIRMED for active commitments,
+    /// CANCELLED for tombstone mutations). `None` when the source ICS
+    /// did not carry STATUS (legacy invitations from non-profile senders).
+    #[serde(default)]
+    pub status: Option<String>,
 }
 
 /// Outgoing reply intent. Maps 1:1 to RFC 5545 PARTSTAT values.
@@ -188,6 +194,21 @@ pub struct Commitment {
     /// status. The list/range queries filter CANCELLED out by default.
     #[serde(default = "default_status")]
     pub status: CommitmentStatus,
+    /// Highest SEQUENCE ever observed in the IMAP folder for this UID.
+    /// `None` means "never seen on IMAP" (Phase-1 row pre-Phase-2 sync,
+    /// or a fresh local create not yet published). A `Some(n)` value
+    /// lets the sync diff distinguish:
+    ///   * "fresh local, needs initial publish" (None)
+    ///   * "was published, then server-side hard-deleted" (Some(n) and
+    ///      local.sequence == n) — accept as cancellation, don't republish
+    ///   * "was published, user has edited locally since" (Some(n) and
+    ///      local.sequence > n) — publish the update
+    /// ADR-0011 §5 doesn't normatively cover the manual-mail-delete
+    /// case; this field is CrystalMail's pragmatic recovery mechanism.
+    /// See `external-contributions/2026-05-07-…` in the timeProtocol
+    /// repo for the proposed ADR clarification.
+    #[serde(default)]
+    pub last_published_sequence: Option<u32>,
     /// Set when `source == IcsImport`: the message id this commitment was
     /// imported from. Not an FK in the db schema (the message may be
     /// deleted later, the commitment should survive).

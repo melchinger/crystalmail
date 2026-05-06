@@ -64,6 +64,7 @@ fn event_to_parsed(event: IcalEvent, method: Option<String>) -> ParsedIcsEvent {
     let organizer = first_participant(&event.properties, "ORGANIZER");
     let attendees = all_participants(&event.properties, "ATTENDEE");
     let is_invitation = !attendees.is_empty();
+    let status = first_property(&event.properties, "STATUS").map(|s| s.to_ascii_uppercase());
     ParsedIcsEvent {
         method,
         uid,
@@ -76,6 +77,7 @@ fn event_to_parsed(event: IcalEvent, method: Option<String>) -> ParsedIcsEvent {
         organizer,
         attendees,
         is_invitation,
+        status,
     }
 }
 
@@ -346,10 +348,16 @@ pub fn ics_to_commitment(
         organizer: parsed.organizer.clone(),
         attendees,
         source: CommitmentSource::IcsImport,
-        // Imports start as confirmed unless the original ICS carried a
-        // STATUS:CANCELLED — Phase 1 ICS parsing doesn't surface STATUS
-        // yet; when it does, route through here.
-        status: CommitmentStatus::Confirmed,
+        status: parsed
+            .status
+            .as_deref()
+            .and_then(CommitmentStatus::from_str)
+            .unwrap_or(CommitmentStatus::Confirmed),
+        // Fresh import — has not been published from this device yet,
+        // so the sync diff treats it as a candidate for initial publish
+        // (or recognizes it as already on the IMAP folder if a sync
+        // round subsequently sees the same UID present remotely).
+        last_published_sequence: None,
         source_message_id,
         created_at: now,
         updated_at: now,
@@ -382,6 +390,7 @@ pub fn manual_commitment(
         attendees,
         source: CommitmentSource::Manual,
         status: CommitmentStatus::Confirmed,
+        last_published_sequence: None,
         source_message_id: None,
         created_at: now,
         updated_at: now,

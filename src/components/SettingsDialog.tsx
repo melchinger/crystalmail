@@ -5,6 +5,7 @@ import type { AccountSummary } from "../types";
 import { HotkeySettings } from "./settings/HotkeySettings";
 import { PiSettings } from "./settings/PiSettings";
 import { AccountSettings } from "./settings/AccountSettings";
+import { CalendarSettings } from "./settings/CalendarSettings";
 import { SpamRulesSettings } from "./settings/SpamRulesSettings";
 import { FolderSyncSettings } from "./settings/FolderSyncSettings";
 import { WorkflowSettings } from "./settings/WorkflowSettings";
@@ -18,6 +19,7 @@ type CategoryId =
   | "folders"
   | "spam"
   | "workflows"
+  | "calendar"
   | "notifications"
   | "hotkeys"
   | "pi"
@@ -47,6 +49,7 @@ const CATEGORIES: { id: CategoryId; labelKey: string; icon: string }[] = [
   { id: "folders", labelKey: "settings.categories.folders", icon: "📁" },
   { id: "spam", labelKey: "settings.categories.spam", icon: "⚠" },
   { id: "workflows", labelKey: "settings.categories.workflows", icon: "⚙" },
+  { id: "calendar", labelKey: "settings.categories.calendar", icon: "📅" },
   {
     id: "notifications",
     labelKey: "settings.categories.notifications",
@@ -173,6 +176,7 @@ export function SettingsDialog({
               onOpenAiSettings={() => setActive("pi")}
             />
           )}
+          {active === "calendar" && <CalendarSettings accounts={accounts} />}
           {active === "notifications" && <NotificationSettings />}
           {active === "hotkeys" && (
             <HotkeySettings
