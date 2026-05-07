@@ -36,6 +36,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/0027_commitments.sql"),
     include_str!("../../migrations/0028_commitment_status.sql"),
     include_str!("../../migrations/0029_last_published_sequence.sql"),
+    include_str!("../../migrations/0030_negotiations.sql"),
 ];
 
 pub fn apply(conn: &mut Connection) -> Result<(), DbError> {

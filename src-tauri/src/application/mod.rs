@@ -17,6 +17,7 @@ pub mod smtp;
 pub mod spam_analysis;
 pub mod spam_rules;
 pub mod sync;
+pub mod timeprotocol_envelope;
 pub mod workflow_analyzer;
 pub mod workflow_rules;
 pub mod workflow_training;

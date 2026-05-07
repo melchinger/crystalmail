@@ -360,6 +360,16 @@ pub enum WriteCmd {
         commitment: crate::timeprotocol::domain::Commitment,
         ack: oneshot::Sender<Result<(), DbError>>,
     },
+    /// Phase-3 negotiation writes. One atomic operation that upserts
+    /// the negotiation row, replaces its slot set, and (optionally)
+    /// appends a new envelope to the message log. Idempotent on the
+    /// envelope's `message_id` — duplicate-delivery is treated as a
+    /// no-op per spec §7.1.
+    ApplyNegotiationUpdate {
+        negotiation: crate::timeprotocol::domain::Negotiation,
+        new_message: Option<crate::timeprotocol::domain::NegotiationMessage>,
+        ack: oneshot::Sender<Result<(), DbError>>,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -870,6 +880,19 @@ fn dispatch(conn: &mut Connection, cmd: WriteCmd) {
                 conn,
                 &commitment,
             ));
+        }
+        WriteCmd::ApplyNegotiationUpdate {
+            negotiation,
+            new_message,
+            ack,
+        } => {
+            let _ = ack.send(
+                crate::timeprotocol::negotiation_store::apply_negotiation_update(
+                    conn,
+                    &negotiation,
+                    new_message.as_ref(),
+                ),
+            );
         }
     }
 }

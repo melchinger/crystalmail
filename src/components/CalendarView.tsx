@@ -10,6 +10,7 @@ import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import type { CalendarSyncReport, Commitment } from "../types";
 import { EventEditor } from "./EventEditor";
+import { NegotiationStartDialog } from "./NegotiationStartDialog";
 
 type EditorState =
   | { mode: "create" }
@@ -26,6 +27,7 @@ export function CalendarView() {
   const [showPast, setShowPast] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [syncStatus, setSyncStatus] = useState<string | null>(null);
+  const [negotiateOpen, setNegotiateOpen] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -137,6 +139,19 @@ export function CalendarView() {
           </label>
           <button
             type="button"
+            onClick={() => setNegotiateOpen(true)}
+            className="rounded px-3 py-1 text-xs"
+            style={{
+              background: "var(--bg-soft)",
+              color: "var(--fg-base)",
+              border: "1px solid var(--border-soft)",
+            }}
+            title={t("calendar.list.negotiateTitle")}
+          >
+            {t("calendar.list.negotiate")}
+          </button>
+          <button
+            type="button"
             onClick={() => setEditor({ mode: "create" })}
             className="rounded px-3 py-1 text-xs font-medium"
             style={{
@@ -209,6 +224,20 @@ export function CalendarView() {
           onDeleted={() => {
             setEditor(null);
             void refresh();
+          }}
+        />
+      )}
+      {negotiateOpen && (
+        <NegotiationStartDialog
+          onClose={() => setNegotiateOpen(false)}
+          onSent={() => {
+            setNegotiateOpen(false);
+            // No list-view yet; the panel only renders inline in the
+            // Reader when the counterparty's response arrives. We
+            // surface a quick toast-equivalent via the sync-status
+            // line so the user gets feedback that the request went
+            // out.
+            setSyncStatus(t("calendar.list.negotiateSent"));
           }}
         />
       )}

@@ -1015,3 +1015,75 @@ export type PreparedImportDraft = {
   /** Roh-Pfad des Templates — rein für UI-Anzeige bzw. Logging. */
   sourceTemplate: string;
 };
+
+// ─── Phase 3: timeProtocol negotiation domain ─────────────────────────────
+
+export type ThreadRole = "initiator" | "responder";
+
+export type NegotiationState =
+  | "requested"
+  | "proposed"
+  | "held"
+  | "confirmed"
+  | "released"
+  | "expired";
+
+export type SlotStatus = "active" | "inactive" | "confirmed" | "released";
+
+export type NegotiationAction =
+  | "request"
+  | "propose"
+  | "counter_propose"
+  | "confirm"
+  | "release"
+  | "hold";
+
+export type MessageDirection = "inbound" | "outbound";
+
+export type NegotiationConstraints = {
+  latest: string | null;
+  preferredTime: string | null;
+  minimumNotice: string | null;
+};
+
+export type NegotiationSlot = {
+  slotId: string;
+  proposerNodeId: string;
+  startAt: string;
+  endAt: string;
+  status: SlotStatus;
+  proposedAt: string;
+};
+
+export type NegotiationMessage = {
+  messageId: string;
+  direction: MessageDirection;
+  action: NegotiationAction;
+  envelope: unknown;
+  sourceMessageId: string | null;
+  receivedAt: string;
+};
+
+export type Negotiation = {
+  id: string;
+  negotiationId: string;
+  threadRole: ThreadRole;
+  state: NegotiationState;
+  durationIso: string | null;
+  constraints: NegotiationConstraints | null;
+  counterpartyEmail: string;
+  counterpartyName: string | null;
+  confirmedCommitmentId: string | null;
+  displaySummary: string | null;
+  slots: NegotiationSlot[];
+  messages: NegotiationMessage[];
+  createdAt: string;
+  updatedAt: string;
+};
+
+/** One slot the responder is offering. Backend mints the slot_id;
+ *  frontend just provides start/end. */
+export type SlotInput = {
+  startAt: string;
+  endAt: string;
+};

@@ -187,6 +187,9 @@
       "syncing": "Sync läuft …",
       "syncTitle": "Mit IMAP-Folder synchronisieren (siehe Einstellungen → Kalender-Sync)",
       "syncDone": "{{imported}} importiert, {{published}} publiziert, {{remoteDeleted}} server-seitig gelöscht, {{errors}} Fehler",
+      "negotiate": "Termin verhandeln",
+      "negotiateTitle": "timeProtocol-Verhandlung mit jemandem starten",
+      "negotiateSent": "Anfrage versendet — Antwort wird im Mail-Reader sichtbar.",
       "bucket": {
         "past": "Vergangen",
         "today": "Heute",
@@ -215,6 +218,76 @@
       "missingTime": "Beginn und Ende müssen gesetzt sein.",
       "endBeforeStart": "Das Ende liegt vor dem Beginn.",
       "notFound": "Termin nicht gefunden."
+    }
+  },
+  "negotiation": {
+    "label": "Termin-Verhandlung",
+    "untitled": "(ohne Titel)",
+    "with": "Mit",
+    "duration": "Dauer",
+    "latest": "Spätestens",
+    "preferred": "Bevorzugt",
+    "durationHm": "{{hours}}h {{minutes}}min",
+    "durationH": "{{hours}}h",
+    "durationM": "{{minutes}} Minuten",
+    "role": {
+      "initiator": "Du hast angefragt",
+      "responder": "Du wurdest angefragt"
+    },
+    "state": {
+      "requested": "Anfrage offen",
+      "proposed": "Vorschläge offen",
+      "held": "Reserviert",
+      "confirmed": "Bestätigt",
+      "released": "Abgebrochen",
+      "expired": "Abgelaufen"
+    },
+    "terminal": {
+      "released": "Diese Verhandlung wurde abgebrochen.",
+      "expired": "Diese Verhandlung ist abgelaufen."
+    },
+    "propose": "Slots vorschlagen",
+    "counterPropose": "Eigene Slots schicken",
+    "counterProposeStart": "Anders vorschlagen",
+    "addSlot": "Slot hinzufügen",
+    "confirm": "Bestätigen",
+    "release": "Ablehnen",
+    "cancel": "Abbrechen",
+    "noActiveSlots": "Keine aktiven Vorschläge mehr — Du musst neu vorschlagen oder die Verhandlung beenden.",
+    "waiting": "Warte auf Antwort der Gegenseite.",
+    "refresh": "Aktualisieren",
+    "confirmedSlot": "Bestätigter Termin: {{range}}",
+    "confirmedNoSlot": "Verhandlung bestätigt — Slot konnte aber nicht aufgelöst werden.",
+    "commitmentMaterialized": "Termin wurde im Kalender angelegt.",
+    "parseError": "Konnte timeProtocol-Envelope nicht parsen: {{error}}",
+    "error": {
+      "send": "Aktion fehlgeschlagen: {{error}}"
+    },
+    "start": {
+      "title": "Termin verhandeln",
+      "account": "Versand-Konto",
+      "to": "Empfänger",
+      "duration": "Dauer",
+      "duration15": "15 Minuten",
+      "duration30": "30 Minuten",
+      "duration45": "45 Minuten",
+      "duration60": "1 Stunde",
+      "duration90": "1 Stunde 30 Minuten",
+      "duration120": "2 Stunden",
+      "summary": "Worum geht's",
+      "summaryPlaceholder": "z.B. Projekt-Sync Q3",
+      "showAdvanced": "Erweitert anzeigen",
+      "hideAdvanced": "Erweitert ausblenden",
+      "latest": "Spätestens",
+      "preferred": "Bevorzugt",
+      "preferredPlaceholder": "z.B. morgens, nachmittags",
+      "minimumNotice": "Mindest-Vorlauf (ISO 8601)",
+      "minimumNoticeHint": "z.B. PT2H für 2 Stunden Vorlauf",
+      "send": "Anfrage senden",
+      "sending": "Sendet …",
+      "cancel": "Abbrechen",
+      "errorNoAccount": "Versand-Konto wählen",
+      "errorNoRecipient": "Empfänger eingeben"
     }
   },
   "compose": {

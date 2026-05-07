@@ -238,3 +238,295 @@ pub struct CommitmentDraft {
     #[serde(default)]
     pub attendees: Vec<CommitmentAttendee>,
 }
+
+// ─── Phase 3: negotiation domain (timeProtocol v0.1 §5 + MVP profile) ────
+//
+// One thread = one `Negotiation` row + N `NegotiationSlot` children + N
+// `NegotiationMessage` children. The state machine (`Requested → Proposed
+// → Confirmed | Released | Expired`) lives on the negotiation; per-slot
+// state (Active | Inactive | Confirmed | Released) lives on each slot
+// because one thread can carry multiple parallel proposals per the MVP
+// profile §4.2 ("A negotiation may have multiple active proposed slots;
+// confirmed applies to exactly one slot_id; remaining proposals become
+// inactive").
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadRole {
+    /// We sent the original `request` envelope; we're waiting for
+    /// proposals from the counterparty.
+    Initiator,
+    /// We received a request; we owe the counterparty proposals.
+    Responder,
+}
+
+impl ThreadRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ThreadRole::Initiator => "initiator",
+            ThreadRole::Responder => "responder",
+        }
+    }
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "initiator" => Some(ThreadRole::Initiator),
+            "responder" => Some(ThreadRole::Responder),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NegotiationState {
+    Requested,
+    Proposed,
+    Held,
+    Confirmed,
+    Released,
+    Expired,
+}
+
+impl NegotiationState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NegotiationState::Requested => "requested",
+            NegotiationState::Proposed => "proposed",
+            NegotiationState::Held => "held",
+            NegotiationState::Confirmed => "confirmed",
+            NegotiationState::Released => "released",
+            NegotiationState::Expired => "expired",
+        }
+    }
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "requested" => Some(NegotiationState::Requested),
+            "proposed" => Some(NegotiationState::Proposed),
+            "held" => Some(NegotiationState::Held),
+            "confirmed" => Some(NegotiationState::Confirmed),
+            "released" => Some(NegotiationState::Released),
+            "expired" => Some(NegotiationState::Expired),
+            _ => None,
+        }
+    }
+    /// MVP profile §4.2: confirmed/released/expired are terminal.
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            NegotiationState::Confirmed
+                | NegotiationState::Released
+                | NegotiationState::Expired
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SlotStatus {
+    /// Slot is on the table — counterparty (or us) can pick it.
+    Active,
+    /// Another slot in the same thread became `confirmed`; this one
+    /// loses by virtue of the MVP-profile single-confirmation rule.
+    Inactive,
+    /// The winning slot for the thread.
+    Confirmed,
+    /// Proposer withdrew this specific slot via a `release_slot` message.
+    Released,
+}
+
+impl SlotStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SlotStatus::Active => "active",
+            SlotStatus::Inactive => "inactive",
+            SlotStatus::Confirmed => "confirmed",
+            SlotStatus::Released => "released",
+        }
+    }
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "active" => Some(SlotStatus::Active),
+            "inactive" => Some(SlotStatus::Inactive),
+            "confirmed" => Some(SlotStatus::Confirmed),
+            "released" => Some(SlotStatus::Released),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NegotiationAction {
+    Request,
+    Propose,
+    CounterPropose,
+    Confirm,
+    Release,
+    /// Optional in MVP profile: declares the sender protects the slot
+    /// locally. Recipient is *not* required to mirror — it's
+    /// informational. CrystalMail accepts incoming `hold` and ignores
+    /// it (no state change); we don't emit `hold` on the wire.
+    Hold,
+}
+
+impl NegotiationAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NegotiationAction::Request => "request",
+            NegotiationAction::Propose => "propose",
+            NegotiationAction::CounterPropose => "counter_propose",
+            NegotiationAction::Confirm => "confirm",
+            NegotiationAction::Release => "release",
+            NegotiationAction::Hold => "hold",
+        }
+    }
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "request" => Some(NegotiationAction::Request),
+            "propose" => Some(NegotiationAction::Propose),
+            "counter_propose" => Some(NegotiationAction::CounterPropose),
+            "confirm" => Some(NegotiationAction::Confirm),
+            "release" => Some(NegotiationAction::Release),
+            "hold" => Some(NegotiationAction::Hold),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageDirection {
+    Inbound,
+    Outbound,
+}
+
+impl MessageDirection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MessageDirection::Inbound => "inbound",
+            MessageDirection::Outbound => "outbound",
+        }
+    }
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "inbound" => Some(MessageDirection::Inbound),
+            "outbound" => Some(MessageDirection::Outbound),
+            _ => None,
+        }
+    }
+}
+
+/// Constraints accompanying a `request`. All optional (MVP profile §4.1).
+/// Carried verbatim from envelope to UI; we don't enforce them
+/// server-side beyond surfacing them when a `propose` violates one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NegotiationConstraints {
+    /// Slot must start before this time. RFC 3339 with offset.
+    #[serde(default)]
+    pub latest: Option<String>,
+    /// Free-form hint from the requester ("morning", "after lunch"…).
+    /// Not machine-enforced in MVP.
+    #[serde(default)]
+    pub preferred_time: Option<String>,
+    /// ISO 8601 duration. Slot start must be at least this far in the
+    /// future relative to the request's timestamp.
+    #[serde(default)]
+    pub minimum_notice: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NegotiationSlot {
+    /// Proposer-owned compound identifier `<node_id>:<local_id>`.
+    pub slot_id: String,
+    pub proposer_node_id: String,
+    pub start_at: String,
+    pub end_at: String,
+    pub status: SlotStatus,
+    pub proposed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NegotiationMessage {
+    pub message_id: String,
+    pub direction: MessageDirection,
+    pub action: NegotiationAction,
+    /// Full envelope JSON for replay / debug. Surfaced to the frontend
+    /// as `serde_json::Value` rather than a strict struct to leave
+    /// room for forward-compatible payload extensions.
+    pub envelope: serde_json::Value,
+    pub source_message_id: Option<String>,
+    pub received_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Negotiation {
+    pub id: String,
+    pub negotiation_id: String,
+    pub thread_role: ThreadRole,
+    pub state: NegotiationState,
+    pub duration_iso: Option<String>,
+    pub constraints: Option<NegotiationConstraints>,
+    pub counterparty_email: String,
+    pub counterparty_name: Option<String>,
+    pub confirmed_commitment_id: Option<String>,
+    pub display_summary: Option<String>,
+    pub slots: Vec<NegotiationSlot>,
+    pub messages: Vec<NegotiationMessage>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Wire envelope per `docs/api-sketch-v0.1.md` "Cross-node negotiation
+/// envelope". All seven fields required (MVP profile §3 envelope rules).
+/// `payload` is loose-typed so each action can have its own shape;
+/// concrete payload structs live alongside the action helpers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Envelope {
+    pub message_id: String,
+    pub from: String,
+    pub to: String,
+    pub negotiation_id: String,
+    pub action: NegotiationAction,
+    /// RFC 3339 with offset. Sender-creation time, not authoritative
+    /// ordering — see api-sketch §"Envelope handling rules".
+    pub timestamp: String,
+    pub payload: serde_json::Value,
+}
+
+/// Payload of a `request` action. All fields optional except `duration`
+/// (which the responder needs to know how big a slot to propose).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestPayload {
+    /// ISO 8601 duration. Required for v1.
+    pub duration: String,
+    #[serde(default)]
+    pub constraints: Option<NegotiationConstraints>,
+    /// Optional human-readable summary the requester wants the responder
+    /// to see ("Project sync about Q3 plan"). Surfaces in the responder's
+    /// UI so they know what they're agreeing to.
+    #[serde(default)]
+    pub summary: Option<String>,
+}
+
+/// Payload of a `propose` or `counter_propose` action.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProposePayload {
+    pub slot_id: String,
+    pub start_at: String,
+    pub end_at: String,
+}
+
+/// Payload of `confirm` / `release` / `hold` — they all reference one
+/// slot_id. (`hold` is incoming-only in our implementation.)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SlotRefPayload {
+    pub slot_id: String,
+}
