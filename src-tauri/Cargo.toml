@@ -1,6 +1,6 @@
 [package]
 name = "crystalmail"
-version = "0.3.0"
+version = "0.4.0"
 description = "Clean, fast, local-first IMAP mail client with pi-powered AI features"
 authors = ["melchinger"]
 edition = "2021"

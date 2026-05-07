@@ -22,6 +22,12 @@ type Props = {
   onClose: () => void;
   onSaved: (commitment: Commitment) => void;
   onDeleted: () => void;
+  /** Pre-fill the start/end times in `create` mode. Used by the
+   *  week/month grid views: clicking an empty area opens the editor
+   *  with the clicked time already filled in. RFC 3339 with offset.
+   *  Ignored in `edit` mode. */
+  initialStartAt?: string | null;
+  initialEndAt?: string | null;
 };
 
 type FormState = {
@@ -47,9 +53,25 @@ export function EventEditor({
   onClose,
   onSaved,
   onDeleted,
+  initialStartAt,
+  initialEndAt,
 }: Props) {
   const { t } = useTranslation();
-  const [form, setForm] = useState<FormState>(EMPTY);
+  // In create mode with prefilled times: seed the form with those.
+  // Otherwise fall back to the "next half hour, +1h" defaults that
+  // the empty constant carries.
+  const [form, setForm] = useState<FormState>(() => {
+    if (mode === "create" && initialStartAt) {
+      return {
+        ...EMPTY,
+        startLocal: rfc3339ToLocalDateTime(initialStartAt),
+        endLocal: initialEndAt
+          ? rfc3339ToLocalDateTime(initialEndAt)
+          : rfc3339ToLocalDateTime(addHour(initialStartAt)),
+      };
+    }
+    return EMPTY;
+  });
   const [loaded, setLoaded] = useState<Commitment | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -422,6 +444,14 @@ function rfc3339ToLocalDateTime(rfc: string): string {
 }
 
 /** Default start = next-rounded-half-hour today (or tomorrow if past 23:30). */
+/** RFC 3339 → RFC 3339, +1 hour. Used to derive a default end time
+ *  when only `initialStartAt` is supplied. */
+function addHour(iso: string): string {
+  const d = new Date(iso);
+  d.setHours(d.getHours() + 1);
+  return d.toISOString();
+}
+
 function defaultStartLocal(): string {
   const d = new Date();
   d.setMinutes(d.getMinutes() + 30);

@@ -16,6 +16,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AccountSummary,
   AttachmentMeta,
+  Commitment,
   Negotiation,
   NegotiationSlot,
   SlotInput,
@@ -190,21 +191,117 @@ function NegotiationActions({
   const { t } = useTranslation();
   const [proposing, setProposing] = useState(false);
   const [proposedSlots, setProposedSlots] = useState<SlotInput[]>([]);
+  const [upcomingCommits, setUpcomingCommits] = useState<Commitment[] | null>(
+    null,
+  );
+
+  // Pre-fetch upcoming commitments so the auto-seed can pick a slot
+  // that doesn't clash. Only when the user is in a state where they
+  // might propose (responder owes a propose, or initiator may
+  // counter-propose) — we don't want to thrash the DB on every
+  // negotiation panel render.
+  const userMayPropose =
+    (neg.state === "requested" && neg.threadRole === "responder") ||
+    (neg.state === "proposed" && neg.threadRole === "initiator");
+  useEffect(() => {
+    if (!userMayPropose) {
+      setUpcomingCommits(null);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const now = new Date();
+        const horizon = new Date(now);
+        horizon.setDate(horizon.getDate() + AUTOSEED_HORIZON_DAYS);
+        const rows = await invoke<Commitment[]>("cal_list_in_range", {
+          from: now.toISOString(),
+          to: horizon.toISOString(),
+        });
+        if (!cancelled) setUpcomingCommits(rows);
+      } catch (e) {
+        // Non-fatal: seed will fall back to "next half hour" with no
+        // conflict-avoidance. Surface in console for diagnostics.
+        // eslint-disable-next-line no-console
+        console.warn("prefetch upcoming commitments failed", e);
+        if (!cancelled) setUpcomingCommits([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [userMayPropose]);
+
+  // Open the propose form. Auto-seeds one default slot so the form is
+  // immediately submit-ready — the user fills the times and clicks
+  // "Senden". Without the seed the form opens empty, the submit button
+  // sits disabled, and users hit the same-labelled trigger again
+  // expecting it to send (it doesn't — silent dead end).
+  //
+  // The seed:
+  //   - takes its duration from the negotiation's `durationIso` (with
+  //     a 30-minute default if absent or unparseable),
+  //   - walks forward from the next half-hour in 30-min steps, picking
+  //     the first slot that doesn't overlap any non-cancelled
+  //     commitment,
+  //   - respects `constraints.latest` (stops searching past it) and
+  //     `constraints.minimumNotice` (shifts the search start forward).
+  // Falls back to `nextHalfHour(now)` if no free slot is found within
+  // the horizon — better an editable conflict than a frozen UI.
+  const openProposeForm = () => {
+    setProposing(true);
+    if (proposedSlots.length === 0) {
+      const durationMinutes =
+        parseIsoDurationMinutes(neg.durationIso) ?? DEFAULT_DURATION_MINUTES;
+      const minimumNoticeMinutes = parseIsoDurationMinutes(
+        neg.constraints?.minimumNotice,
+      );
+      const start = findFreeSlot({
+        from: new Date(),
+        durationMinutes,
+        commits: upcomingCommits ?? [],
+        latestIso: neg.constraints?.latest,
+        minimumNoticeMinutes,
+      });
+      const end = new Date(start);
+      end.setMinutes(end.getMinutes() + durationMinutes);
+      setProposedSlots([
+        { startAt: start.toISOString(), endAt: end.toISOString() },
+      ]);
+    }
+  };
 
   const sendPropose = async (isCounter: boolean) => {
-    if (proposedSlots.length === 0) return;
+    if (proposedSlots.length === 0) {
+      // Should not happen — submit is disabled when slots is empty.
+      // Surfaced anyway so diagnostic users see the click was registered.
+      // eslint-disable-next-line no-console
+      console.warn("tp_send_propose_slots: no slots to send, ignoring click");
+      return;
+    }
     setBusy(true);
     try {
+      // eslint-disable-next-line no-console
+      console.info("tp_send_propose_slots: sending", {
+        negotiationId: neg.negotiationId,
+        slots: proposedSlots,
+        accountId: account.id,
+        isCounter,
+      });
       const updated = await invoke<Negotiation>("tp_send_propose_slots", {
         negotiationId: neg.negotiationId,
         slots: proposedSlots,
         accountId: account.id,
         isCounter,
       });
+      // eslint-disable-next-line no-console
+      console.info("tp_send_propose_slots: ok", updated);
       onUpdated(updated);
       setProposing(false);
       setProposedSlots([]);
     } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error("tp_send_propose_slots: failed", e);
       alert(t("negotiation.error.send", { error: String(e) }));
     } finally {
       setBusy(false);
@@ -295,9 +392,10 @@ function NegotiationActions({
           setProposedSlots([]);
         }}
         onSubmit={() => void sendPropose(false)}
-        onStart={() => setProposing(true)}
+        onStart={openProposeForm}
         busy={busy}
         ctaKey="negotiation.propose"
+        submitKey="negotiation.sendSlots"
       />
     );
   }
@@ -316,9 +414,10 @@ function NegotiationActions({
             setProposedSlots([]);
           }}
           onSubmit={() => void sendPropose(true)}
-          onStart={() => setProposing(true)}
+          onStart={openProposeForm}
           busy={busy}
           ctaKey="negotiation.counterPropose"
+          submitKey="negotiation.sendSlots"
         />
       );
     }
@@ -362,6 +461,7 @@ function SlotProposeForm({
   onSubmit,
   busy,
   ctaKey,
+  submitKey,
 }: {
   proposing: boolean;
   slots: SlotInput[];
@@ -371,6 +471,11 @@ function SlotProposeForm({
   onSubmit: () => void;
   busy: boolean;
   ctaKey: string;
+  /** Label for the submit button INSIDE the form. Distinct from
+   *  `ctaKey` (which labels the form-trigger button shown when
+   *  `proposing=false`) so users see "Senden" once they're inside the
+   *  form, not the same "Slots vorschlagen" they just clicked. */
+  submitKey: string;
 }) {
   const { t } = useTranslation();
   if (!proposing) {
@@ -480,7 +585,7 @@ function SlotProposeForm({
             border: "1px solid var(--border-soft)",
           }}
         >
-          {t(ctaKey)}
+          {busy ? t("negotiation.sending") : t(submitKey)}
         </button>
         <button
           type="button"
@@ -648,4 +753,96 @@ function nextHalfHour(d: Date): Date {
   out.setSeconds(0, 0);
   out.setMinutes(out.getMinutes() < 30 ? 30 : 60);
   return out;
+}
+
+// ─── Auto-seed helpers ───────────────────────────────────────────────────
+//
+// The propose form opens with one default slot pre-filled. Picking that
+// slot well is "soft AI" — there's no single correct answer, but a few
+// sensible heuristics keep the user from manually paging past the next
+// six conflicts on first open.
+//
+// Heuristic stack, applied in order:
+//   1. Use the negotiation's own `durationIso` (so a "PT1H" request
+//      seeds a 1h slot, not 30 min).
+//   2. Honour `constraints.minimumNotice` — shift the search start
+//      forward by that much.
+//   3. Honour `constraints.latest` — stop searching past it.
+//   4. Walk forward in 30-min steps from the next half-hour, picking
+//      the first window that doesn't overlap any non-cancelled
+//      commitment we know about.
+//
+// Out of scope for v1 (would be premature):
+//   - Working hours / weekend bias (some users genuinely propose
+//     evenings; baking 9–17 in would be paternalistic).
+//   - Multi-slot pre-seed (we seed one; adding more is one click).
+//   - Looking past `AUTOSEED_HORIZON_DAYS` of pre-fetched commitments.
+
+const DEFAULT_DURATION_MINUTES = 30;
+const AUTOSEED_HORIZON_DAYS = 30;
+const AUTOSEED_STEP_MINUTES = 30;
+
+/** Parse a small subset of ISO 8601 durations (`PT15M`, `PT1H`,
+ *  `PT1H30M`) into total minutes. Returns `null` for anything we don't
+ *  understand — the caller should treat that as "no constraint" and
+ *  fall back to its own default. */
+function parseIsoDurationMinutes(
+  iso: string | null | undefined,
+): number | null {
+  if (!iso) return null;
+  const m = iso.match(/^PT(?:(\d+)H)?(?:(\d+)M)?$/);
+  if (!m) return null;
+  const hours = m[1] ? Number(m[1]) : 0;
+  const minutes = m[2] ? Number(m[2]) : 0;
+  const total = hours * 60 + minutes;
+  return total > 0 ? total : null;
+}
+
+/** Find the earliest start time at or after `from` that:
+ *    - is at least `minimumNoticeMinutes` in the future,
+ *    - does not overlap any non-cancelled commitment in `commits`,
+ *    - is before `latestIso` if set,
+ *  walking the search clock in `AUTOSEED_STEP_MINUTES`-min steps from
+ *  the next half-hour. Falls back to `nextHalfHour(from)` (even if it
+ *  conflicts) when no free slot exists in the horizon — better an
+ *  editable conflict than a frozen UI. */
+function findFreeSlot(args: {
+  from: Date;
+  durationMinutes: number;
+  commits: Commitment[];
+  latestIso: string | null | undefined;
+  minimumNoticeMinutes: number | null;
+}): Date {
+  const { from, durationMinutes, commits, latestIso, minimumNoticeMinutes } =
+    args;
+  const fromWithNotice = new Date(from);
+  if (minimumNoticeMinutes && minimumNoticeMinutes > 0) {
+    fromWithNotice.setMinutes(
+      fromWithNotice.getMinutes() + minimumNoticeMinutes,
+    );
+  }
+  const busy = commits
+    .filter((c) => c.status !== "CANCELLED")
+    .map((c) => ({
+      start: new Date(c.startAt).getTime(),
+      end: new Date(c.endAt).getTime(),
+    }))
+    .sort((a, b) => a.start - b.start);
+  const latestMs = latestIso ? new Date(latestIso).getTime() : null;
+  const horizon =
+    fromWithNotice.getTime() + AUTOSEED_HORIZON_DAYS * 24 * 3600 * 1000;
+  const stepMs = AUTOSEED_STEP_MINUTES * 60 * 1000;
+  const durationMs = durationMinutes * 60 * 1000;
+
+  let candidate = nextHalfHour(fromWithNotice);
+  while (candidate.getTime() < horizon) {
+    const startMs = candidate.getTime();
+    const endMs = startMs + durationMs;
+    if (latestMs !== null && startMs > latestMs) break;
+    // Half-open overlap check: [start, end) ∩ [b.start, b.end) ≠ ∅
+    const overlaps = busy.some((b) => b.start < endMs && b.end > startMs);
+    if (!overlaps) return candidate;
+    candidate = new Date(candidate.getTime() + stepMs);
+  }
+  return nextHalfHour(fromWithNotice);
 }

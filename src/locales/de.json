@@ -198,6 +198,16 @@
         "later": "Später"
       }
     },
+    "view": {
+      "list": "Liste",
+      "week": "Woche",
+      "month": "Monat"
+    },
+    "nav": {
+      "prev": "Zurück",
+      "next": "Weiter",
+      "today": "Heute"
+    },
     "editor": {
       "createTitle": "Neuer Termin",
       "editTitle": "Termin bearbeiten",
@@ -250,6 +260,8 @@
     "counterPropose": "Eigene Slots schicken",
     "counterProposeStart": "Anders vorschlagen",
     "addSlot": "Slot hinzufügen",
+    "sendSlots": "Senden",
+    "sending": "Sendet …",
     "confirm": "Bestätigen",
     "release": "Ablehnen",
     "cancel": "Abbrechen",
