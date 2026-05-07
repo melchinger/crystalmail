@@ -1,6 +1,13 @@
 # dependencies
 node_modules/
 
+# Project standardises on npm (`package-lock.json` is the source of
+# truth; CI does `npm ci`). pnpm/yarn lockfiles must NOT be committed
+# — `tauri-action` auto-detects them, switches to pnpm/yarn, and the
+# release workflow then breaks because the runner only has npm.
+pnpm-lock.yaml
+yarn.lock
+
 # build output
 dist/
 build/

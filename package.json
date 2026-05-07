@@ -1,6 +1,6 @@
 {
   "name": "crystalmail",
-  "version": "0.3.0",
+  "version": "0.4.2",
   "description": "Clean, fast, local-first IMAP mail client with pi-powered AI features",
   "private": true,
   "type": "module",
@@ -12,7 +12,7 @@
     "tauri": "tauri"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2",
+    "@tauri-apps/api": "^2.11.0",
     "@tauri-apps/plugin-dialog": "^2",
     "@tauri-apps/plugin-shell": "^2.3.5",
     "i18next": "^23.15.1",
@@ -22,7 +22,7 @@
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.2.4",
-    "@tauri-apps/cli": "^2",
+    "@tauri-apps/cli": "^2.11.1",
     "@types/react": "^18.3.1",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.1",

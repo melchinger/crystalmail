@@ -12,6 +12,7 @@ import {
 import { WorkflowResultDialog } from "./WorkflowResultDialog";
 import { decodeImapFolderName } from "../utils/imapFolderName";
 import { IcsInvitePanel } from "./IcsInvitePanel";
+import { NegotiationPanel } from "./NegotiationPanel";
 import {
   TRUSTED_SENDERS_CHANGED,
   addTrustedDomain,
@@ -979,6 +980,12 @@ function MessageView({
         attachments={detail.attachments}
         account={account}
         onCompose={onCompose}
+      />
+
+      <NegotiationPanel
+        messageId={env.id}
+        attachments={detail.attachments}
+        account={account}
       />
 
       <div className="min-h-0 flex-1 overflow-hidden">

@@ -378,6 +378,12 @@ fn main() {
             timeprotocol::commands::cal_get_config,
             timeprotocol::commands::cal_set_config,
             timeprotocol::commands::cal_sync_imap,
+            timeprotocol::commands::tp_apply_envelope_from_attachment,
+            timeprotocol::commands::tp_get_negotiation,
+            timeprotocol::commands::tp_send_propose_slots,
+            timeprotocol::commands::tp_send_confirm_slot,
+            timeprotocol::commands::tp_send_release_slot,
+            timeprotocol::commands::tp_send_initial_request,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")

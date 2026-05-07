@@ -15,17 +15,22 @@
 
 use std::path::PathBuf;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 use tokio::sync::oneshot;
+use uuid::Uuid;
 
 use super::domain::{
-    Commitment, CommitmentDraft, CommitmentStatus, InvitationResponse, ParsedIcsEvent,
+    Commitment, CommitmentAttendee, CommitmentDraft, CommitmentSource, CommitmentStatus,
+    Envelope, IcsParticipant, InvitationResponse, MessageDirection, Negotiation,
+    NegotiationAction, ParsedIcsEvent, SlotStatus, ThreadRole,
 };
-use super::{ics, store};
-use crate::application::attachments;
+use super::{ics, negotiation_engine, negotiation_store, store};
+use crate::application::{attachments, smtp, timeprotocol_envelope};
+use crate::domain::account::AccountId;
 use crate::domain::message::MessageId;
 use crate::infrastructure::db::WriteCmd;
+use crate::infrastructure::queries;
 use crate::state::{AppState, CalendarConfig};
 
 // ─── Phase 2.1: persisted calendar IMAP-sync config ──────────────────────
@@ -591,4 +596,743 @@ fn slugify(s: &str) -> String {
         }
     }
     out.trim_matches('-').to_string()
+}
+
+// ─── Phase 3: negotiation commands ────────────────────────────────────────
+
+/// Idempotent: parse the timeProtocol envelope from a `text/calendar`/-
+/// adjacent attachment of an open mail, apply it to the negotiation
+/// state machine, persist the result, and return the up-to-date
+/// `Negotiation` for the frontend to render.
+///
+/// `own_email` lets the engine decide which side of the envelope is
+/// "us" — typically the open mail's account address. The Reader has
+/// it from `account.address` and threads it through here.
+///
+/// Re-calling this on a mail whose `message_id` has already been
+/// processed is a no-op: we look up the existing negotiation and
+/// return it unchanged. That makes the command safe to invoke on
+/// every Reader render.
+#[tauri::command]
+pub async fn tp_apply_envelope_from_attachment(
+    app: AppHandle,
+    message_id: MessageId,
+    part_idx: u32,
+    own_email: String,
+) -> Result<Negotiation, String> {
+    let state = app.state::<AppState>();
+    let db = state.db.get().ok_or("database not ready")?;
+
+    let message_id_for_log = message_id.0.to_string();
+    let envelope = {
+        let db = db.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            timeprotocol_envelope::parse_envelope_from_attachment(&db, &message_id, part_idx)
+        })
+        .await
+        .map_err(|e| format!("envelope parse task panicked: {e}"))??
+    };
+
+    // Idempotency check: have we already processed this message_id?
+    {
+        let db_for_lookup = db.clone();
+        let mid = envelope.message_id.clone();
+        let already = tauri::async_runtime::spawn_blocking(move || -> Result<bool, String> {
+            let conn = db_for_lookup.reads.get().map_err(|e| e.to_string())?;
+            negotiation_store::message_id_exists(&conn, &mid).map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| format!("idempotency lookup panicked: {e}"))??;
+        if already {
+            // Return the current state without re-applying. Look up by
+            // negotiation_id (now in `envelope`).
+            let neg_id = envelope.negotiation_id.clone();
+            let db_for_lookup = db.clone();
+            let neg = tauri::async_runtime::spawn_blocking(
+                move || -> Result<Option<Negotiation>, String> {
+                    let conn = db_for_lookup.reads.get().map_err(|e| e.to_string())?;
+                    negotiation_store::get_by_negotiation_id(&conn, &neg_id)
+                        .map_err(|e| e.to_string())
+                },
+            )
+            .await
+            .map_err(|e| format!("negotiation lookup panicked: {e}"))??;
+            return neg.ok_or_else(|| {
+                format!(
+                    "message_id {} already processed but negotiation row missing",
+                    envelope.message_id
+                )
+            });
+        }
+    }
+
+    // Look up existing negotiation (None = fresh request).
+    let existing = {
+        let db_for_lookup = db.clone();
+        let neg_id = envelope.negotiation_id.clone();
+        tauri::async_runtime::spawn_blocking(
+            move || -> Result<Option<Negotiation>, String> {
+                let conn = db_for_lookup.reads.get().map_err(|e| e.to_string())?;
+                negotiation_store::get_by_negotiation_id(&conn, &neg_id)
+                    .map_err(|e| e.to_string())
+            },
+        )
+        .await
+        .map_err(|e| format!("negotiation lookup panicked: {e}"))??
+    };
+
+    // Apply.
+    let (mut updated, message) = negotiation_engine::apply_envelope(
+        existing.as_ref(),
+        &envelope,
+        MessageDirection::Inbound,
+        &own_email,
+        Some(message_id_for_log),
+    )?;
+
+    // Persist atomically through the writer actor.
+    let (tx, rx) = oneshot::channel();
+    db.writer
+        .send(WriteCmd::ApplyNegotiationUpdate {
+            negotiation: updated.clone(),
+            new_message: Some(message.clone()),
+            ack: tx,
+        })
+        .await
+        .map_err(|_| "writer channel closed")?;
+    rx.await
+        .map_err(|_| "writer dropped ack".to_string())?
+        .map_err(|e| format!("db apply: {e}"))?;
+
+    // Hydrate the messages list (the engine returned an empty one).
+    let neg_id_for_hydrate = updated.negotiation_id.clone();
+    let db_for_hydrate = db.clone();
+    let hydrated = tauri::async_runtime::spawn_blocking(
+        move || -> Result<Option<Negotiation>, String> {
+            let conn = db_for_hydrate.reads.get().map_err(|e| e.to_string())?;
+            negotiation_store::get_by_negotiation_id(&conn, &neg_id_for_hydrate)
+                .map_err(|e| e.to_string())
+        },
+    )
+    .await
+    .map_err(|e| format!("hydrate panicked: {e}"))??;
+    if let Some(h) = hydrated {
+        updated = h;
+    }
+
+    // If this envelope tipped the thread into Confirmed, materialise
+    // a local Commitment so the user sees the meeting in their
+    // calendar without a separate click.
+    if matches!(updated.state, super::domain::NegotiationState::Confirmed) {
+        if let Err(e) = materialize_commitment_if_confirmed(&app, &updated.negotiation_id).await {
+            tracing::warn!(error = %e, "tp inbound confirm: materialise failed");
+        } else {
+            // Re-fetch one more time to surface the freshly-set
+            // confirmed_commitment_id back to the frontend.
+            let neg_id_final = updated.negotiation_id.clone();
+            let db_final = db.clone();
+            if let Ok(Some(refreshed)) = tauri::async_runtime::spawn_blocking(
+                move || -> Result<Option<Negotiation>, String> {
+                    let conn = db_final.reads.get().map_err(|e| e.to_string())?;
+                    negotiation_store::get_by_negotiation_id(&conn, &neg_id_final)
+                        .map_err(|e| e.to_string())
+                },
+            )
+            .await
+            .unwrap_or(Ok(None))
+            {
+                updated = refreshed;
+            }
+        }
+    }
+    Ok(updated)
+}
+
+/// Read-only fetch by negotiation_id. Used by the panel after a
+/// response is sent to refresh the displayed state.
+#[tauri::command]
+pub async fn tp_get_negotiation(
+    app: AppHandle,
+    negotiation_id: String,
+) -> Result<Option<Negotiation>, String> {
+    let state = app.state::<AppState>();
+    let db = state.db.get().ok_or("database not ready")?;
+    tauri::async_runtime::spawn_blocking({
+        let db = db.clone();
+        move || -> Result<Option<Negotiation>, String> {
+            let conn = db.reads.get().map_err(|e| e.to_string())?;
+            negotiation_store::get_by_negotiation_id(&conn, &negotiation_id)
+                .map_err(|e| e.to_string())
+        }
+    })
+    .await
+    .map_err(|e| format!("tp_get_negotiation panicked: {e}"))?
+}
+
+/// One slot the responder is offering. Multi-slot per propose
+/// envelope per the v0.1-MVP profile is supported by sending several
+/// `propose` envelopes back-to-back; for v1 we keep the per-call
+/// shape simple (caller picks one slot per click; multi-slot UI on
+/// top is a future cleanup).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SlotInput {
+    pub start_at: String,
+    pub end_at: String,
+}
+
+/// Send a fresh `request` envelope to start a new negotiation. Mints
+/// the `negotiation_id` (initiating-node ownership per spec
+/// §"Identifier rules"), persists the new thread as a local
+/// Initiator-side row, and dispatches the mail. The returned
+/// `Negotiation` has state=Requested with no slots yet — the
+/// counterparty's eventual `propose` envelope (or our future
+/// counter-propose) will fill those in.
+#[tauri::command]
+pub async fn tp_send_initial_request(
+    app: AppHandle,
+    account_id: AccountId,
+    to_email: String,
+    duration: String,
+    latest: Option<String>,
+    preferred_time: Option<String>,
+    minimum_notice: Option<String>,
+    summary: Option<String>,
+) -> Result<Negotiation, String> {
+    if to_email.trim().is_empty() {
+        return Err("recipient email required".into());
+    }
+    if duration.trim().is_empty() {
+        return Err("duration required (e.g. PT45M)".into());
+    }
+    let our_email = own_email_for_account(&app, &account_id).await?;
+    if our_email.eq_ignore_ascii_case(to_email.trim()) {
+        return Err("cannot start a negotiation with yourself".into());
+    }
+
+    let constraints_json = serde_json::json!({
+        "latest": latest,
+        "preferredTime": preferred_time,
+        "minimumNotice": minimum_notice,
+    });
+    // Build the envelope with a freshly-minted negotiation_id. The
+    // initiating node owns this id for the entire thread; subsequent
+    // envelopes from the counterparty will reference it back.
+    let negotiation_id = format!("{our_email}:neg-{}", Uuid::new_v4());
+    let envelope = Envelope {
+        message_id: format!("{our_email}:msg-{}", Uuid::new_v4()),
+        from: our_email.clone(),
+        to: to_email.trim().to_string(),
+        negotiation_id: negotiation_id.clone(),
+        action: NegotiationAction::Request,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        payload: serde_json::json!({
+            "duration": duration,
+            "constraints": constraints_json,
+            "summary": summary,
+        }),
+    };
+
+    // Apply outbound to the engine — `existing=None` means the engine
+    // bootstraps a fresh Initiator-side Negotiation row.
+    let (updated, message) = negotiation_engine::apply_envelope(
+        None,
+        &envelope,
+        MessageDirection::Outbound,
+        &our_email,
+        None,
+    )?;
+
+    // Persist before sending: same optimistic-local-commit pattern as
+    // the response commands. SMTP failures still leave the local state
+    // visible so the user can retry from the (now-existing) panel.
+    let state = app.state::<AppState>();
+    let db = state.db.get().ok_or("database not ready")?;
+    let (tx, rx) = oneshot::channel();
+    db.writer
+        .send(WriteCmd::ApplyNegotiationUpdate {
+            negotiation: updated.clone(),
+            new_message: Some(message),
+            ack: tx,
+        })
+        .await
+        .map_err(|_| "writer channel closed")?;
+    rx.await
+        .map_err(|_| "writer dropped ack".to_string())?
+        .map_err(|e| format!("db apply: {e}"))?;
+
+    // Build + send the mail.
+    let envelope_json = serde_json::to_vec_pretty(&envelope)
+        .map_err(|e| format!("envelope serialize: {e}"))?;
+    let attachment_path = write_envelope_temp_file(&envelope.message_id, &envelope_json)?;
+    let mail_subject = format!(
+        "[TimeProtocol] request — {}",
+        summary.as_deref().unwrap_or("Termin")
+    );
+    let mail_body = format!(
+        "Diese Mail enthält eine timeProtocol-Negotiation-Anfrage (request).\n\
+         Wenn dein Mail-Client das Format nicht erkennt, wird die Anfrage\n\
+         als gewöhnliche Mail mit JSON-Anhang angezeigt — du kannst sie\n\
+         einfach ignorieren.\n\n\
+         Dauer: {duration}\n"
+    );
+    let req = smtp::SendMailRequest {
+        account_id: account_id.clone(),
+        from: None,
+        to: vec![to_email.trim().to_string()],
+        cc: vec![],
+        bcc: vec![],
+        subject: mail_subject,
+        body: mail_body,
+        body_html: None,
+        in_reply_to: None,
+        references: vec![],
+        attachments: vec![smtp::AttachmentSpec {
+            path: attachment_path.to_string_lossy().into_owned(),
+            filename: Some("envelope-request.json".into()),
+            mime_type: Some("application/time-protocol+json".into()),
+        }],
+    };
+    smtp::send(db, req).await.map_err(|e| format!("smtp: {e}"))?;
+
+    // Return the hydrated negotiation row so the frontend can
+    // immediately render an Initiator-side waiting view.
+    fetch_negotiation(&app, &negotiation_id).await
+}
+
+/// Send a `propose` (or `counter_propose` if `is_counter`) for one or
+/// more slots. Each slot ships as its own envelope/mail per the MVP
+/// profile §4.1; one Tauri call sends all of them sequentially.
+#[tauri::command]
+pub async fn tp_send_propose_slots(
+    app: AppHandle,
+    negotiation_id: String,
+    slots: Vec<SlotInput>,
+    account_id: AccountId,
+    is_counter: bool,
+) -> Result<Negotiation, String> {
+    if slots.is_empty() {
+        return Err("at least one slot required".into());
+    }
+    let action = if is_counter {
+        NegotiationAction::CounterPropose
+    } else {
+        NegotiationAction::Propose
+    };
+    for slot in &slots {
+        let payload = serde_json::json!({
+            "type": match action {
+                NegotiationAction::CounterPropose => "counter_propose_slot",
+                _ => "propose_slot",
+            },
+            "slotId": format!("{}:slot-{}", own_email_for_account(&app, &account_id).await?, Uuid::new_v4()),
+            "startAt": slot.start_at,
+            "endAt": slot.end_at,
+        });
+        send_outbound_envelope(&app, &account_id, &negotiation_id, action, payload).await?;
+    }
+    fetch_negotiation(&app, &negotiation_id).await
+}
+
+/// Confirm one slot. Spec §5: this is a binding declaration; on
+/// receipt the counterparty independently materialises a local
+/// `commitment` for the slot. We materialise on our side too (in
+/// `super::sync::materialize_commitment_from_negotiation`, called
+/// after persistence below).
+#[tauri::command]
+pub async fn tp_send_confirm_slot(
+    app: AppHandle,
+    negotiation_id: String,
+    slot_id: String,
+    account_id: AccountId,
+) -> Result<Negotiation, String> {
+    let payload = serde_json::json!({
+        "type": "confirm_slot",
+        "slotId": slot_id,
+    });
+    send_outbound_envelope(
+        &app,
+        &account_id,
+        &negotiation_id,
+        NegotiationAction::Confirm,
+        payload,
+    )
+    .await?;
+    // Outbound confirm side: we materialise the commitment on send,
+    // mirroring the receiver who'll do the same on receipt.
+    if let Err(e) = materialize_commitment_if_confirmed(&app, &negotiation_id).await {
+        tracing::warn!(error = %e, "tp outbound confirm: materialise failed");
+    }
+    fetch_negotiation(&app, &negotiation_id).await
+}
+
+/// Release a slot (or the whole thread once no Active slots remain).
+#[tauri::command]
+pub async fn tp_send_release_slot(
+    app: AppHandle,
+    negotiation_id: String,
+    slot_id: String,
+    account_id: AccountId,
+) -> Result<Negotiation, String> {
+    let payload = serde_json::json!({
+        "type": "release_slot",
+        "slotId": slot_id,
+    });
+    send_outbound_envelope(
+        &app,
+        &account_id,
+        &negotiation_id,
+        NegotiationAction::Release,
+        payload,
+    )
+    .await?;
+    fetch_negotiation(&app, &negotiation_id).await
+}
+
+// ─── Outbound helpers ─────────────────────────────────────────────────────
+
+async fn own_email_for_account(
+    app: &AppHandle,
+    account_id: &AccountId,
+) -> Result<String, String> {
+    let state = app.state::<AppState>();
+    let db = state.db.get().ok_or("database not ready")?;
+    let account_id = account_id.clone();
+    tauri::async_runtime::spawn_blocking({
+        let db = db.clone();
+        move || -> Result<String, String> {
+            let conn = db.reads.get().map_err(|e| e.to_string())?;
+            queries::get_account(&conn, &account_id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "account not found".to_string())
+                .map(|a| a.address)
+        }
+    })
+    .await
+    .map_err(|e| format!("own_email task panicked: {e}"))?
+}
+
+async fn fetch_negotiation(
+    app: &AppHandle,
+    negotiation_id: &str,
+) -> Result<Negotiation, String> {
+    let state = app.state::<AppState>();
+    let db = state.db.get().ok_or("database not ready")?;
+    let neg_id = negotiation_id.to_string();
+    tauri::async_runtime::spawn_blocking({
+        let db = db.clone();
+        move || -> Result<Negotiation, String> {
+            let conn = db.reads.get().map_err(|e| e.to_string())?;
+            negotiation_store::get_by_negotiation_id(&conn, &neg_id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "negotiation row vanished after write".to_string())
+        }
+    })
+    .await
+    .map_err(|e| format!("fetch_negotiation panicked: {e}"))?
+}
+
+/// The outbound envelope path: build envelope, persist outbound
+/// message via the engine + writer actor, write JSON to a temp file,
+/// dispatch SMTP. Fire-and-forget at the SMTP level — we await it so
+/// the user sees an error rather than a silent drop. Network failure
+/// here surfaces to the caller as `Err(_)`.
+async fn send_outbound_envelope(
+    app: &AppHandle,
+    account_id: &AccountId,
+    negotiation_id: &str,
+    action: NegotiationAction,
+    payload: serde_json::Value,
+) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let db = state.db.get().ok_or("database not ready")?;
+    let our_email = own_email_for_account(app, account_id).await?;
+
+    // Look up the existing negotiation to get the counterparty.
+    let existing = {
+        let db_for_lookup = db.clone();
+        let neg_id = negotiation_id.to_string();
+        tauri::async_runtime::spawn_blocking(
+            move || -> Result<Option<Negotiation>, String> {
+                let conn = db_for_lookup.reads.get().map_err(|e| e.to_string())?;
+                negotiation_store::get_by_negotiation_id(&conn, &neg_id)
+                    .map_err(|e| e.to_string())
+            },
+        )
+        .await
+        .map_err(|e| format!("negotiation lookup panicked: {e}"))??
+    }
+    .ok_or_else(|| {
+        format!("no negotiation found for id {negotiation_id} — cannot respond")
+    })?;
+
+    let envelope = Envelope {
+        message_id: format!("{our_email}:msg-{}", Uuid::new_v4()),
+        from: our_email.clone(),
+        to: existing.counterparty_email.clone(),
+        negotiation_id: existing.negotiation_id.clone(),
+        action,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        payload,
+    };
+
+    // Apply outbound envelope to engine to compute new state.
+    let (updated, message) = negotiation_engine::apply_envelope(
+        Some(&existing),
+        &envelope,
+        MessageDirection::Outbound,
+        &our_email,
+        None,
+    )?;
+
+    // Persist BEFORE sending the mail. If the SMTP send fails the
+    // user sees the error but the local state already reflects the
+    // intent — they can retry by reopening the panel and clicking
+    // again, which sees the message_id (not yet seen by the
+    // counterparty) and won't re-persist. The counterparty just
+    // never sees a message that doesn't exist on their side.
+    //
+    // This is consciously "optimistic local commit" — it's the same
+    // model as the existing iMIP REPLY flow (compose-then-send;
+    // store the local commitment regardless of SMTP outcome).
+    let (tx, rx) = oneshot::channel();
+    db.writer
+        .send(WriteCmd::ApplyNegotiationUpdate {
+            negotiation: updated.clone(),
+            new_message: Some(message),
+            ack: tx,
+        })
+        .await
+        .map_err(|_| "writer channel closed")?;
+    rx.await
+        .map_err(|_| "writer dropped ack".to_string())?
+        .map_err(|e| format!("db apply: {e}"))?;
+
+    // Build the mail. Single attachment (the JSON envelope) + a
+    // text/plain body that explains what arrived for human readers
+    // (not all counterparties will be timeProtocol-aware in v0.1).
+    let envelope_json = serde_json::to_vec_pretty(&envelope)
+        .map_err(|e| format!("envelope serialize: {e}"))?;
+    let attachment_path = write_envelope_temp_file(&envelope.message_id, &envelope_json)?;
+    let subject = format!(
+        "[TimeProtocol] {} — {}",
+        action.as_str(),
+        existing
+            .display_summary
+            .as_deref()
+            .unwrap_or("Termin")
+    );
+    let body = format!(
+        "Diese Mail enthält eine timeProtocol-Negotiation-Aktion ({}).\n\
+         Wenn dein Mail-Client das Format nicht erkennt, wird die Anfrage\n\
+         als gewöhnliche Mail mit JSON-Anhang angezeigt — du kannst sie\n\
+         einfach ignorieren.\n",
+        action.as_str()
+    );
+    let req = smtp::SendMailRequest {
+        account_id: account_id.clone(),
+        from: None,
+        to: vec![existing.counterparty_email.clone()],
+        cc: vec![],
+        bcc: vec![],
+        subject,
+        body,
+        body_html: None,
+        in_reply_to: None,
+        references: vec![],
+        attachments: vec![smtp::AttachmentSpec {
+            path: attachment_path.to_string_lossy().into_owned(),
+            filename: Some(format!(
+                "envelope-{}.json",
+                action.as_str().replace('_', "-")
+            )),
+            mime_type: Some("application/time-protocol+json".into()),
+        }],
+    };
+    smtp::send(db, req).await.map_err(|e| format!("smtp: {e}"))?;
+    Ok(())
+}
+
+fn write_envelope_temp_file(message_id: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+    let dir = std::env::temp_dir().join("crystalmail").join("tp-envelope");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create temp dir: {e}"))?;
+    let safe_id = message_id.replace([':', '/', '\\'], "_");
+    let path = dir.join(format!("{safe_id}.json"));
+    std::fs::write(&path, bytes).map_err(|e| format!("write envelope file: {e}"))?;
+    Ok(path)
+}
+
+/// If the negotiation has reached `Confirmed` and we haven't yet
+/// materialised a `Commitment` for it, create the commitment row and
+/// link it back via `confirmed_commitment_id`. Per MVP profile §4.1:
+/// "Upon receiving a valid confirm, both nodes independently create a
+/// local commitment for the confirmed slot." This helper covers both
+/// directions — inbound (we received their confirm) and outbound (we
+/// sent the confirm).
+///
+/// Returns the new commitment's id when one was created, `None` when
+/// no work was needed.
+async fn materialize_commitment_if_confirmed(
+    app: &AppHandle,
+    negotiation_id: &str,
+) -> Result<Option<String>, String> {
+    let state = app.state::<AppState>();
+    let db = state.db.get().ok_or("database not ready")?;
+
+    // Re-fetch the negotiation post-update so we see the canonical
+    // confirmed slot and any prior materialisation marker.
+    let neg = {
+        let db_for_lookup = db.clone();
+        let neg_id = negotiation_id.to_string();
+        tauri::async_runtime::spawn_blocking(
+            move || -> Result<Option<Negotiation>, String> {
+                let conn = db_for_lookup.reads.get().map_err(|e| e.to_string())?;
+                negotiation_store::get_by_negotiation_id(&conn, &neg_id)
+                    .map_err(|e| e.to_string())
+            },
+        )
+        .await
+        .map_err(|e| format!("materialize lookup panicked: {e}"))??
+    };
+    let neg = match neg {
+        Some(n) => n,
+        None => return Ok(None),
+    };
+    if neg.state != super::domain::NegotiationState::Confirmed {
+        return Ok(None);
+    }
+    if neg.confirmed_commitment_id.is_some() {
+        return Ok(None);
+    }
+    let confirmed_slot = match neg
+        .slots
+        .iter()
+        .find(|s| matches!(s.status, SlotStatus::Confirmed))
+    {
+        Some(s) => s,
+        None => {
+            tracing::warn!(
+                negotiation_id = %neg.negotiation_id,
+                "state=Confirmed but no slot has SlotStatus::Confirmed; skipping materialise"
+            );
+            return Ok(None);
+        }
+    };
+
+    // Build the commitment. The organiser semantics in spec/v0.1.md §3.1
+    // pin to the initiator of the negotiation; the responder is just
+    // an attendee. Both sides land as ATTENDEE rows with PARTSTAT
+    // ACCEPTED, since by the time we hit Confirmed the slot is
+    // mutually agreed.
+    let our_email = own_email_for_thread(&neg);
+    let now = chrono::Utc::now();
+    let organizer_email = match neg.thread_role {
+        ThreadRole::Initiator => our_email.clone(),
+        ThreadRole::Responder => neg.counterparty_email.clone(),
+    };
+    let commitment_id = Uuid::new_v4().to_string();
+    let commitment = Commitment {
+        id: commitment_id.clone(),
+        // UID derived from the negotiation_id so a future re-confirm
+        // (rare; would only happen via a Phase 2.5+ recovery path)
+        // upserts in place rather than producing a duplicate row.
+        uid: format!("tp:{}", neg.negotiation_id),
+        sequence: 0,
+        summary: neg
+            .display_summary
+            .clone()
+            .or_else(|| Some(format!("Termin mit {}", neg.counterparty_email))),
+        description: Some(format!(
+            "Aus Negotiation {} ({}) materialisiert.",
+            neg.negotiation_id,
+            neg.thread_role.as_str()
+        )),
+        location: None,
+        start_at: confirmed_slot.start_at.clone(),
+        end_at: confirmed_slot.end_at.clone(),
+        original_tzid: None,
+        organizer: Some(IcsParticipant {
+            email: organizer_email.clone(),
+            display_name: None,
+        }),
+        attendees: vec![
+            CommitmentAttendee {
+                email: our_email,
+                display_name: None,
+                partstat: Some("ACCEPTED".into()),
+            },
+            CommitmentAttendee {
+                email: neg.counterparty_email.clone(),
+                display_name: neg.counterparty_name.clone(),
+                partstat: Some("ACCEPTED".into()),
+            },
+        ],
+        source: CommitmentSource::Negotiation,
+        status: CommitmentStatus::Confirmed,
+        last_published_sequence: None,
+        source_message_id: None,
+        created_at: now,
+        updated_at: now,
+    };
+
+    let (tx, rx) = oneshot::channel();
+    db.writer
+        .send(WriteCmd::UpsertCommitment {
+            commitment,
+            ack: tx,
+        })
+        .await
+        .map_err(|_| "writer channel closed")?;
+    rx.await
+        .map_err(|_| "writer dropped ack".to_string())?
+        .map_err(|e| format!("db upsert commitment: {e}"))?;
+
+    // Link the commitment back to the negotiation row so the UI can
+    // jump from one to the other.
+    let mut linked = neg.clone();
+    linked.confirmed_commitment_id = Some(commitment_id.clone());
+    linked.updated_at = now;
+    let (tx, rx) = oneshot::channel();
+    db.writer
+        .send(WriteCmd::ApplyNegotiationUpdate {
+            negotiation: linked,
+            new_message: None,
+            ack: tx,
+        })
+        .await
+        .map_err(|_| "writer channel closed")?;
+    rx.await
+        .map_err(|_| "writer dropped ack".to_string())?
+        .map_err(|e| format!("db link commitment: {e}"))?;
+
+    // Push to the IMAP calendar folder if Phase-2 sync is enabled —
+    // same path as a manual edit through `cal_create`.
+    super::sync::spawn_background_sync(app, "tp_confirm_materialize");
+    Ok(Some(commitment_id))
+}
+
+/// We don't carry our own email on the negotiation row (it would be
+/// redundant — the protocol identifies us as "the side that isn't the
+/// counterparty"). The materialise helper needs it, though, to fill
+/// the `ATTENDEE` row. Derived from the thread role + counterparty:
+///
+///   - Initiator: we are NOT the counterparty; check the latest
+///     outbound message in the log and take its `from` field.
+///   - Responder: same — earliest outbound message reflects our
+///     identity at the time we replied.
+///
+/// Falling back to an empty string is acceptable as last resort; the
+/// commitment row stays valid, the ATTENDEE entry just lacks our
+/// address. UI shows the counterparty regardless.
+fn own_email_for_thread(neg: &Negotiation) -> String {
+    neg.messages
+        .iter()
+        .find(|m| matches!(m.direction, MessageDirection::Outbound))
+        .and_then(|m| {
+            m.envelope
+                .get("from")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_default()
 }

@@ -28,5 +28,7 @@
 pub mod commands;
 pub mod domain;
 pub mod ics;
+pub mod negotiation_engine;
+pub mod negotiation_store;
 pub mod store;
 pub mod sync;
