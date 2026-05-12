@@ -26,6 +26,7 @@ import { CalendarView } from "./components/CalendarView";
 import { ContactsView } from "./components/ContactsView";
 import { ContactDetail } from "./components/ContactDetail";
 import { UndoSendOverlay } from "./components/UndoSendOverlay";
+import { MeetingJoinOverlay } from "./components/MeetingJoinOverlay";
 import { HotkeyHelp } from "./components/HotkeyHelp";
 import { CommandPalette } from "./components/CommandPalette";
 import { useAiEnabled } from "./utils/aiState";
@@ -2220,6 +2221,13 @@ export function App() {
           onCancel={onUndoSendCancel}
         />
       )}
+
+      {/* Meeting-Beitreten-Overlay: zeigt 5 min vor Start eines Termins
+          mit erkanntem Meeting-Link im "Ort"-Feld eine Toast-Pille mit
+          Titel und Beitreten-Button. Während des Termins zeigt es die
+          Restlaufzeit. Eigene Datenquelle (pollt `cal_list_in_range`),
+          damit App nicht den Kalender-State halten muss. */}
+      <MeetingJoinOverlay />
 
       {hotkeyHelp && (
         <HotkeyHelp

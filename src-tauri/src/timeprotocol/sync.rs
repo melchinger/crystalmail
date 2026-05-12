@@ -215,10 +215,20 @@ pub async fn run(
     let messages = calendar_imap::list_messages(db, account_id, folder).await?;
     let (winners, mut errors) = resolve_winners(&messages, own_email);
 
-    // Step 4 — read local state including CANCELLED rows.
+    // Step 4 — read local state including CANCELLED rows. RRULE-expanded
+    // occurrences (`series_uid IS NOT NULL`) are excluded from the sync:
+    // they were never originated on this device, publishing fan-out 50
+    // per series would clog the IMAP folder, and a remote third-party
+    // client reading the folder would interpret them as 50 unrelated
+    // events instead of one series. The user can still see those events
+    // locally; only the cross-device-distribution path is skipped.
     let locals: Vec<Commitment> = {
         let conn = db.reads.get().map_err(|e| e.to_string())?;
-        store::list_all_with_attendees(&conn).map_err(|e| e.to_string())?
+        store::list_all_with_attendees(&conn)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter(|c| c.series_uid.is_none())
+            .collect()
     };
     let local_by_uid: HashMap<String, &Commitment> =
         locals.iter().map(|c| (c.uid.clone(), c)).collect();
@@ -707,6 +717,8 @@ mod tests {
             status: CommitmentStatus::Confirmed,
             last_published_sequence: None,
             source_message_id: None,
+            series_uid: None,
+            subscription_id: None,
             created_at: now,
             updated_at: now,
         };

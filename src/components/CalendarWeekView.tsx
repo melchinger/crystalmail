@@ -29,12 +29,24 @@
 
 import { useMemo } from "react";
 import type { Commitment } from "../types";
+import {
+  allDaySpanInDays,
+  eventColor,
+  isAllDayEvent,
+} from "../utils/calendarEvent";
+
+/** Subset of `CalendarSubscription` the views need for color lookup. */
+type SubInfo = { color: string; name: string };
 
 type Props = {
   /** Any date in the week to render. The view auto-snaps to the
    *  containing Mon–Sun pair. */
   anchorDate: Date;
   events: Commitment[];
+  /** Subscription id → display info (color, name). Used to tint event
+   *  bars per source calendar. Empty map is fine — events without a
+   *  subscriptionId fall back to the accent color. */
+  subscriptionsById: ReadonlyMap<string, SubInfo>;
   onPickEvent: (id: string) => void;
   /** Click on empty space inside a day column. The Date carries the
    *  resolved start time (rounded down to a 30-min slot). The parent
@@ -64,6 +76,7 @@ const TIME_FMT = new Intl.DateTimeFormat(undefined, {
 export function CalendarWeekView({
   anchorDate,
   events,
+  subscriptionsById,
   onPickEvent,
   onCreateAt,
 }: Props) {
@@ -83,14 +96,27 @@ export function CalendarWeekView({
     return d;
   }, [weekStart]);
 
-  // Filter events overlapping this week (half-open).
-  const weekEvents = useMemo(() => {
-    return events.filter((e) => {
+  // Filter events overlapping this week (half-open). Split into two
+  // tracks: all-day events go above the hour grid as horizontal bars
+  // spanning their day-range; everything else stays inside the time
+  // grid where it gets positioned by start_at.
+  const { weekEvents, allDayLayout } = useMemo(() => {
+    const overlapping = events.filter((e) => {
       if (e.status === "CANCELLED") return false;
       const s = new Date(e.startAt).getTime();
       const en = new Date(e.endAt).getTime();
       return s < weekEnd.getTime() && en > weekStart.getTime();
     });
+    const allDay: Commitment[] = [];
+    const timed: Commitment[] = [];
+    for (const e of overlapping) {
+      if (isAllDayEvent(e)) allDay.push(e);
+      else timed.push(e);
+    }
+    return {
+      weekEvents: timed,
+      allDayLayout: layoutAllDayBars(allDay, weekStart),
+    };
   }, [events, weekStart, weekEnd]);
 
   const today = startOfDay(new Date());
@@ -127,6 +153,76 @@ export function CalendarWeekView({
         })}
       </div>
 
+      {/* All-day track: one row per overlapping bar, horizontal span
+          across the day columns the event covers. Sits between the
+          weekday header and the time grid; auto-hides when there are
+          no all-day events for the visible week. */}
+      {allDayLayout.length > 0 && (
+        <div
+          className="relative grid"
+          style={{
+            gridTemplateColumns: "3rem repeat(7, 1fr)",
+            background: "var(--bg-base)",
+            borderBottom: "1px solid var(--border-base)",
+          }}
+        >
+          <div
+            className="px-1 py-1 text-[10px] uppercase tracking-wide"
+            style={{ color: "var(--fg-subtle)" }}
+          >
+            ganz&shy;tags
+          </div>
+          {/* Per-day backgrounds so the lane keeps the today-tint /
+              weekend-tint visual rhythm of the hour grid below. */}
+          {days.map((d) => {
+            const dayStart = startOfDay(d).getTime();
+            const isToday = dayStart === today.getTime();
+            const isWeekend = d.getDay() === 0 || d.getDay() === 6;
+            return (
+              <div
+                key={`bg-${d.toISOString()}`}
+                style={{
+                  borderLeft: "1px solid var(--border-soft)",
+                  background: isToday
+                    ? "var(--bg-soft)"
+                    : isWeekend
+                      ? "var(--bg-subtle, transparent)"
+                      : "transparent",
+                }}
+              />
+            );
+          })}
+          {/* Absolute-positioned bars on top of the grid backgrounds.
+              We address the day columns by `gridColumnStart` (1-indexed,
+              with column 1 = time-label gutter, so day i sits at
+              column i+2). */}
+          {allDayLayout.map((bar, rowIdx) => (
+            <button
+              key={bar.commitment.id}
+              type="button"
+              onClick={(ev) => {
+                ev.stopPropagation();
+                onPickEvent(bar.commitment.id);
+              }}
+              className="m-0.5 truncate rounded px-1.5 py-0.5 text-left text-[11px] leading-tight hover:opacity-80"
+              style={{
+                gridColumnStart: bar.startCol + 2,
+                gridColumnEnd: `span ${bar.spanCols}`,
+                gridRowStart: rowIdx + 1,
+                background: eventColor(bar.commitment, subscriptionsById),
+                color: "#fff",
+                border: "1px solid rgba(0,0,0,0.1)",
+              }}
+              title={bar.commitment.summary ?? "—"}
+            >
+              {bar.continuesLeft ? "← " : ""}
+              {bar.commitment.summary ?? "—"}
+              {bar.continuesRight ? " →" : ""}
+            </button>
+          ))}
+        </div>
+      )}
+
       {/* Body: time-label column + 7 day columns. Fills remaining
           height of the parent so the grid scales with the window
           (bigger window → bigger event blocks → larger readable
@@ -161,6 +257,7 @@ export function CalendarWeekView({
             key={day.toISOString()}
             day={day}
             events={weekEvents}
+            subscriptionsById={subscriptionsById}
             onPickEvent={onPickEvent}
             onCreateAt={onCreateAt}
           />
@@ -173,11 +270,13 @@ export function CalendarWeekView({
 function DayColumn({
   day,
   events,
+  subscriptionsById,
   onPickEvent,
   onCreateAt,
 }: {
   day: Date;
   events: Commitment[];
+  subscriptionsById: ReadonlyMap<string, SubInfo>;
   onPickEvent: (id: string) => void;
   onCreateAt: (start: Date) => void;
 }) {
@@ -287,7 +386,7 @@ function DayColumn({
               top: `${topPct}%`,
               height: `${heightPct}%`,
               minHeight: "20px",
-              background: "var(--accent)",
+              background: eventColor(commitment, subscriptionsById),
               color: "#fff",
               border: "1px solid rgba(0,0,0,0.1)",
             }}
@@ -340,4 +439,67 @@ function mondayOf(d: Date): Date {
 
 function pad2(n: number): string {
   return String(n).padStart(2, "0");
+}
+
+/** Layout entry for one bar in the all-day track. */
+type AllDayBar = {
+  commitment: Commitment;
+  /** 0-indexed day column where the bar starts (0 = Monday). */
+  startCol: number;
+  /** Number of day columns the bar spans (1..7). */
+  spanCols: number;
+  /** True when the event started before this visible week — render an
+   *  "←" so the user knows to scroll back to see its real start. */
+  continuesLeft: boolean;
+  /** Twin of the above for the right edge. */
+  continuesRight: boolean;
+};
+
+/**
+ * Clip each all-day event to the [weekStart, weekStart+7d) window and
+ * compute its column span. Ordering is start-date ASC → longer-first so
+ * a week-spanning event renders above day-stickers in the track.
+ *
+ * We don't pack rows tightly — every event gets its own row. Real users
+ * rarely have more than 2-3 all-day events overlapping; the simplicity
+ * pays for itself.
+ */
+function layoutAllDayBars(
+  events: Commitment[],
+  weekStart: Date,
+): AllDayBar[] {
+  const weekStartMs = weekStart.getTime();
+  const weekEndMs = weekStartMs + 7 * 24 * 60 * 60 * 1000;
+  const result: AllDayBar[] = [];
+  for (const e of events) {
+    const startMs = new Date(e.startAt).getTime();
+    const endMs = new Date(e.endAt).getTime();
+    if (startMs >= weekEndMs || endMs <= weekStartMs) continue;
+    const clampedStart = Math.max(startMs, weekStartMs);
+    const clampedEnd = Math.min(endMs, weekEndMs);
+    const startCol = Math.floor((clampedStart - weekStartMs) / (24 * 60 * 60 * 1000));
+    // For the end column we compute span from clamped duration. Note
+    // RFC-5545 DATE-only DTEND is exclusive (next day at 00:00), so a
+    // 1-day all-day event has 24h duration and spans exactly 1 column.
+    const totalDays = allDaySpanInDays(e);
+    const visibleDays = Math.min(totalDays, 7 - startCol);
+    const spanCols = Math.max(
+      1,
+      Math.min(visibleDays, Math.ceil((clampedEnd - clampedStart) / (24 * 60 * 60 * 1000))),
+    );
+    result.push({
+      commitment: e,
+      startCol,
+      spanCols,
+      continuesLeft: startMs < weekStartMs,
+      continuesRight: endMs > weekEndMs,
+    });
+  }
+  // Longer bars first so they sit on the upper rows; ties broken by
+  // start time.
+  result.sort((a, b) => {
+    if (b.spanCols !== a.spanCols) return b.spanCols - a.spanCols;
+    return a.startCol - b.startCol;
+  });
+  return result;
 }

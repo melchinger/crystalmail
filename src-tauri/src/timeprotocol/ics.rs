@@ -38,17 +38,30 @@ const PRODID: &str = "-//CrystalMail//Calendar 1.0//EN";
 /// VFREEBUSY-only blob, or a CANCEL whose VEVENT was stripped). Returns `Err`
 /// for genuinely broken input the parser refuses.
 pub fn parse(raw: &[u8]) -> Result<Option<ParsedIcsEvent>, String> {
+    // Stay compatible with single-event callers (mail-attachment path) — we
+    // discard everything past the first event. For the multi-event file
+    // import use `parse_all`.
+    Ok(parse_all(raw)?.into_iter().next())
+}
+
+/// Like `parse`, but returns every VEVENT in every VCALENDAR contained in
+/// `raw` (in order). Used by the user-driven .ics file import where one
+/// file can legitimately carry many events (Outlook bulk export, a shared
+/// "team holidays" calendar, etc.). The per-event METHOD is inherited
+/// from the VCALENDAR it sits in — RFC 5545 attaches METHOD at the
+/// calendar level, so all events in the same VCALENDAR share it.
+pub fn parse_all(raw: &[u8]) -> Result<Vec<ParsedIcsEvent>, String> {
     let cursor = Cursor::new(raw);
-    let mut parser = IcalParser::new(cursor);
-    let Some(first) = parser.next() else {
-        return Ok(None);
-    };
-    let cal = first.map_err(|e| format!("ical parse: {e}"))?;
-    let method = first_property(&cal.properties, "METHOD");
-    let Some(event) = cal.events.into_iter().next() else {
-        return Ok(None);
-    };
-    Ok(Some(event_to_parsed(event, method)))
+    let parser = IcalParser::new(cursor);
+    let mut out = Vec::new();
+    for cal_result in parser {
+        let cal = cal_result.map_err(|e| format!("ical parse: {e}"))?;
+        let method = first_property(&cal.properties, "METHOD");
+        for event in cal.events {
+            out.push(event_to_parsed(event, method.clone()));
+        }
+    }
+    Ok(out)
 }
 
 fn event_to_parsed(event: IcalEvent, method: Option<String>) -> ParsedIcsEvent {
@@ -56,15 +69,25 @@ fn event_to_parsed(event: IcalEvent, method: Option<String>) -> ParsedIcsEvent {
     let sequence = first_property(&event.properties, "SEQUENCE")
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(0);
-    let summary = first_property(&event.properties, "SUMMARY");
-    let description = first_property(&event.properties, "DESCRIPTION");
-    let location = first_property(&event.properties, "LOCATION");
+    // TEXT-typed properties (RFC 5545 §3.3.11) carry escapes that the
+    // underlying ical crate does not resolve: `\n` (or `\N`) for newlines,
+    // `\,` / `\;` for literal punctuation, `\\` for a backslash. Zoom and
+    // most servers emit DESCRIPTION as a single physical line full of `\n`
+    // tokens — leaving them literal puts ugly `\n` in the user's editor.
+    let summary = first_property(&event.properties, "SUMMARY").map(|s| unescape_text(&s));
+    let description =
+        first_property(&event.properties, "DESCRIPTION").map(|s| unescape_text(&s));
+    let location = first_property(&event.properties, "LOCATION").map(|s| unescape_text(&s));
     let dtstart = first_property(&event.properties, "DTSTART");
     let dtend = first_property(&event.properties, "DTEND");
     let organizer = first_participant(&event.properties, "ORGANIZER");
     let attendees = all_participants(&event.properties, "ATTENDEE");
     let is_invitation = !attendees.is_empty();
     let status = first_property(&event.properties, "STATUS").map(|s| s.to_ascii_uppercase());
+    // RRULE is not a TEXT property — it carries a structured semicolon-
+    // separated key=value list (FREQ=, BYDAY=, etc.), no escape sequences
+    // to resolve. We pass the raw value through to the expander.
+    let rrule = first_property(&event.properties, "RRULE");
     ParsedIcsEvent {
         method,
         uid,
@@ -78,6 +101,7 @@ fn event_to_parsed(event: IcalEvent, method: Option<String>) -> ParsedIcsEvent {
         attendees,
         is_invitation,
         status,
+        rrule,
     }
 }
 
@@ -271,6 +295,31 @@ fn escape_text(s: &str) -> String {
     out
 }
 
+/// Inverse of `escape_text`: resolve RFC 5545 §3.3.11 escapes inside a TEXT
+/// property value. `\n` and `\N` both decode to LF; `\\`, `\;`, `\,` decode
+/// to their literal form. Unknown escapes are kept loosely: the backslash
+/// is dropped and the following char is taken verbatim — same behavior most
+/// other clients exhibit. A trailing lone backslash is preserved as-is.
+fn unescape_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') | Some('N') => out.push('\n'),
+            Some('\\') => out.push('\\'),
+            Some(';') => out.push(';'),
+            Some(',') => out.push(','),
+            Some(other) => out.push(other),
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
 fn escape_param(s: &str) -> String {
     // Parameter values containing ":", ";", "," or whitespace must be
     // double-quoted. Quotes themselves get stripped (RFC 5545 §3.2 reserves
@@ -359,9 +408,159 @@ pub fn ics_to_commitment(
         // round subsequently sees the same UID present remotely).
         last_published_sequence: None,
         source_message_id,
+        // The plain `ics_to_commitment` builds a stand-alone row even if
+        // the source carries an RRULE — the multi-row expansion lives in
+        // `expand_series_into_commitments`. Callers who want occurrences
+        // route through that instead.
+        series_uid: None,
+        subscription_id: None,
         created_at: now,
         updated_at: now,
     })
+}
+
+/// Expand a parsed VEVENT into one-or-more Commitment rows. For events
+/// without RRULE this returns a single-element Vec equivalent to
+/// `ics_to_commitment`. For events with RRULE the master is dropped and
+/// each occurrence (capped at `max`, bounded by `[window_start,
+/// window_end]`) is emitted as its own Commitment with `series_uid` set
+/// to the master UID. See `expand_series_into_commitments` for the
+/// expansion details; this is the public surface the import-pipe calls.
+pub fn ics_to_commitments(
+    parsed: &ParsedIcsEvent,
+    source_message_id: Option<String>,
+    my_email: Option<&str>,
+    my_partstat: Option<InvitationResponse>,
+) -> Result<Vec<Commitment>, String> {
+    // Default expansion window: −1y / +2y. Most useful occurrences a user
+    // wants to see sit inside that envelope; long-tail series can be
+    // re-imported later with a different anchor if they need more.
+    let now = Utc::now();
+    let window_start = now - chrono::Duration::days(365);
+    let window_end = now + chrono::Duration::days(365 * 2);
+    expand_series_into_commitments(
+        parsed,
+        source_message_id,
+        my_email,
+        my_partstat,
+        window_start,
+        window_end,
+        200,
+    )
+}
+
+/// Implementation detail of `ics_to_commitments` — split out so the test
+/// surface can drive a deterministic window and cap. Returns `[master]`
+/// when no RRULE is present.
+pub fn expand_series_into_commitments(
+    parsed: &ParsedIcsEvent,
+    source_message_id: Option<String>,
+    my_email: Option<&str>,
+    my_partstat: Option<InvitationResponse>,
+    window_start: chrono::DateTime<Utc>,
+    window_end: chrono::DateTime<Utc>,
+    max: u16,
+) -> Result<Vec<Commitment>, String> {
+    // Always build the master first — single-event imports stop here, and
+    // the recurring-event path clones from this for per-occurrence rows.
+    let master = ics_to_commitment(parsed, source_message_id, my_email, my_partstat)?;
+
+    let Some(rrule_raw) = parsed.rrule.as_deref().map(str::trim).filter(|s| !s.is_empty())
+    else {
+        return Ok(vec![master]);
+    };
+    let dtstart_raw = parsed
+        .dtstart
+        .as_deref()
+        .ok_or("event with RRULE missing DTSTART")?;
+
+    // Feed the rrule crate the full DTSTART+RRULE block. The crate handles
+    // TZID/Z/floating DTSTART variants natively; we just have to inject
+    // the right separator (`;` for TZID, `:` otherwise).
+    let dtstart_line = if dtstart_raw.starts_with("TZID=") {
+        format!("DTSTART;{dtstart_raw}")
+    } else {
+        format!("DTSTART:{dtstart_raw}")
+    };
+    let rrule_line = if rrule_raw.to_ascii_uppercase().starts_with("RRULE:") {
+        rrule_raw.to_string()
+    } else {
+        format!("RRULE:{rrule_raw}")
+    };
+    let blob = format!("{dtstart_line}\n{rrule_line}");
+
+    let rrule_set: rrule::RRuleSet = blob
+        .parse()
+        .map_err(|e| format!("rrule parse ({blob:?}): {e}"))?;
+
+    // Window bounds in rrule's Tz wrapper. We translate UTC → rrule::Tz::UTC
+    // — the crate matches occurrence absolute moments regardless of the
+    // event's source TZ, so UTC bounds are correct.
+    let after_dt = rrule::Tz::UTC
+        .from_utc_datetime(&window_start.naive_utc());
+    let before_dt = rrule::Tz::UTC
+        .from_utc_datetime(&window_end.naive_utc());
+
+    let result = rrule_set
+        .after(after_dt)
+        .before(before_dt)
+        .all(max);
+    let occurrences = result.dates;
+
+    // Each occurrence inherits the master's wall-clock duration and the
+    // master's display offset, so the user sees consistent local times
+    // even when the source crossed a DST boundary mid-series.
+    let master_start = chrono::DateTime::parse_from_rfc3339(&master.start_at)
+        .map_err(|e| format!("master start_at parse: {e}"))?;
+    let master_end = chrono::DateTime::parse_from_rfc3339(&master.end_at)
+        .map_err(|e| format!("master end_at parse: {e}"))?;
+    let duration = master_end.signed_duration_since(master_start);
+    let display_offset: FixedOffset = *master_start.offset();
+
+    let now = Utc::now();
+    let mut out = Vec::with_capacity(occurrences.len());
+    for occ in occurrences {
+        let occ_utc = occ.with_timezone(&Utc);
+        let occ_start = occ_utc.with_timezone(&display_offset);
+        let occ_end = occ_start + duration;
+
+        // Synthetic UID: master plus occurrence wall-clock — matches the
+        // semantics of RECURRENCE-ID enough for our purposes and stays
+        // stable across re-imports of the same series.
+        let occ_uid = format!(
+            "{}@{}",
+            master.uid,
+            occ_start.format("%Y%m%dT%H%M%S")
+        );
+
+        out.push(Commitment {
+            id: Uuid::new_v4().to_string(),
+            uid: occ_uid,
+            sequence: master.sequence,
+            summary: master.summary.clone(),
+            description: master.description.clone(),
+            location: master.location.clone(),
+            start_at: occ_start.to_rfc3339(),
+            end_at: occ_end.to_rfc3339(),
+            original_tzid: master.original_tzid.clone(),
+            organizer: master.organizer.clone(),
+            attendees: master.attendees.clone(),
+            source: master.source,
+            status: master.status,
+            last_published_sequence: None,
+            source_message_id: master.source_message_id.clone(),
+            series_uid: Some(master.uid.clone()),
+            // Subscription-id stays None here — recurring expansions
+            // from `cal_import_ics_file` go into SQLite, not the
+            // subscription overlay. The subscription-pipe sets this
+            // field itself in `subscriptions::parse_and_expand`.
+            subscription_id: None,
+            created_at: now,
+            updated_at: now,
+        });
+    }
+
+    Ok(out)
 }
 
 /// Build a fresh Commitment from a manual-create form. UID gets a freshly
@@ -392,6 +591,8 @@ pub fn manual_commitment(
         status: CommitmentStatus::Confirmed,
         last_published_sequence: None,
         source_message_id: None,
+        series_uid: None,
+        subscription_id: None,
         created_at: now,
         updated_at: now,
     }
@@ -660,5 +861,148 @@ END:VCALENDAR\r\n";
             None,
         );
         assert!(reply.contains("SUMMARY:a\\; b\\, c \\\\ d"));
+    }
+
+    #[test]
+    fn unescape_text_resolves_rfc5545_sequences() {
+        assert_eq!(unescape_text("line1\\nline2"), "line1\nline2");
+        assert_eq!(unescape_text("upper\\Nlower"), "upper\nlower");
+        assert_eq!(unescape_text("a\\;b\\,c"), "a;b,c");
+        assert_eq!(unescape_text("path C:\\\\Users"), "path C:\\Users");
+        // Trailing lone backslash is preserved.
+        assert_eq!(unescape_text("dangling\\"), "dangling\\");
+        // Unknown escape: drop the backslash, keep the char.
+        assert_eq!(unescape_text("\\x"), "x");
+    }
+
+    #[test]
+    fn parse_all_returns_every_vevent() {
+        // Two VEVENTs in one VCALENDAR plus a VTODO that must not show up
+        // (we only care about events, the parser already drops non-VEVENT
+        // sub-components via `cal.events`).
+        let ics = "BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+PRODID:-//Test//EN\r\n\
+BEGIN:VEVENT\r\n\
+UID:one@example.com\r\n\
+DTSTAMP:20260423T080000Z\r\n\
+DTSTART:20260423T090000Z\r\n\
+DTEND:20260423T100000Z\r\n\
+SUMMARY:First\r\n\
+END:VEVENT\r\n\
+BEGIN:VEVENT\r\n\
+UID:two@example.com\r\n\
+DTSTAMP:20260423T080000Z\r\n\
+DTSTART:20260424T090000Z\r\n\
+DTEND:20260424T100000Z\r\n\
+SUMMARY:Second\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR\r\n";
+        let all = parse_all(ics.as_bytes()).expect("parse_all");
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].uid, "one@example.com");
+        assert_eq!(all[0].summary.as_deref(), Some("First"));
+        assert_eq!(all[1].uid, "two@example.com");
+        assert_eq!(all[1].summary.as_deref(), Some("Second"));
+        // Single-event parse() must still pick exactly the first one.
+        let single = parse(ics.as_bytes()).expect("parse").expect("event");
+        assert_eq!(single.uid, "one@example.com");
+    }
+
+    #[test]
+    fn parse_all_on_empty_returns_empty_vec() {
+        assert!(parse_all(b"").expect("parse_all").is_empty());
+    }
+
+    #[test]
+    fn expands_weekly_series_with_count() {
+        // FREQ=WEEKLY;COUNT=5 starting 2026-04-23T09:00:00Z — five
+        // weekly occurrences, all tagged with the master UID as series.
+        let ics = "BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+PRODID:-//Test//EN\r\n\
+BEGIN:VEVENT\r\n\
+UID:weekly@example.com\r\n\
+DTSTAMP:20260423T080000Z\r\n\
+DTSTART:20260423T090000Z\r\n\
+DTEND:20260423T100000Z\r\n\
+SUMMARY:Weekly Sync\r\n\
+RRULE:FREQ=WEEKLY;COUNT=5\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR\r\n";
+        let parsed = parse(ics.as_bytes()).unwrap().unwrap();
+        assert_eq!(parsed.rrule.as_deref(), Some("FREQ=WEEKLY;COUNT=5"));
+
+        // Window centered on the series so all 5 occurrences fit.
+        let window_start = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let window_end = Utc.with_ymd_and_hms(2027, 1, 1, 0, 0, 0).unwrap();
+        let rows = expand_series_into_commitments(
+            &parsed,
+            None,
+            None,
+            None,
+            window_start,
+            window_end,
+            200,
+        )
+        .expect("expand");
+        assert_eq!(rows.len(), 5);
+        // Every row carries the master's UID as series_uid and a unique
+        // synthetic UID of its own. Build the unique-set in one pass and
+        // compare cardinality — keeps the assertion message free of the
+        // raw UID values (CodeQL flags `format!("…{uid}")` as cleartext
+        // logging of sensitive data; false positive for RFC-5545 event
+        // UIDs but the rewrite is cheap).
+        let unique_uids: std::collections::HashSet<&str> =
+            rows.iter().map(|r| r.uid.as_str()).collect();
+        assert_eq!(unique_uids.len(), rows.len(), "duplicate uid in series");
+        for row in &rows {
+            assert_eq!(row.series_uid.as_deref(), Some("weekly@example.com"));
+            assert!(row.uid.starts_with("weekly@example.com@"));
+            assert_eq!(row.summary.as_deref(), Some("Weekly Sync"));
+        }
+        // First occurrence is the DTSTART itself; the fifth is +4 weeks.
+        assert!(rows[0].start_at.starts_with("2026-04-23"));
+        assert!(rows[4].start_at.starts_with("2026-05-21"));
+    }
+
+    #[test]
+    fn non_recurring_event_returns_single_row_without_series_uid() {
+        let parsed = parse(SAMPLE_REQUEST.as_bytes()).unwrap().unwrap();
+        assert!(parsed.rrule.is_none());
+        let rows = ics_to_commitments(&parsed, None, None, None).expect("commitments");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].series_uid.is_none());
+    }
+
+    #[test]
+    fn parses_description_with_newlines_unescaped() {
+        // Mimics what Zoom and most servers emit: DESCRIPTION as one
+        // physical line with `\n` separating logical lines.
+        let ics = "BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+METHOD:REQUEST\r\n\
+PRODID:-//Test//EN\r\n\
+BEGIN:VEVENT\r\n\
+UID:zoom@example.com\r\n\
+SEQUENCE:0\r\n\
+DTSTAMP:20260423T080000Z\r\n\
+DTSTART:20260423T090000Z\r\n\
+DTEND:20260423T100000Z\r\n\
+SUMMARY:Zoom call\r\n\
+DESCRIPTION:Join Zoom Meeting\\nhttps://zoom.us/j/123\\n\\nMeeting ID: 123\r\n\
+LOCATION:https://zoom.us/j/123\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR\r\n";
+        let parsed = parse(ics.as_bytes()).unwrap().unwrap();
+        let desc = parsed.description.as_deref().unwrap();
+        assert!(
+            !desc.contains("\\n"),
+            "literal \\n leaked through into description: {desc:?}"
+        );
+        assert!(desc.contains("Join Zoom Meeting\n"));
+        assert!(desc.contains("https://zoom.us/j/123\n"));
+        // Blank line between URL and "Meeting ID".
+        assert!(desc.contains("\n\nMeeting ID: 123"));
     }
 }

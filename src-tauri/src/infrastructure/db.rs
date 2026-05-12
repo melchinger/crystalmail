@@ -360,6 +360,15 @@ pub enum WriteCmd {
         commitment: crate::timeprotocol::domain::Commitment,
         ack: oneshot::Sender<Result<(), DbError>>,
     },
+    /// Cascade-delete every row whose `series_uid` matches — "ganze
+    /// Serie absagen" on an RRULE-expanded occurrence. Series rows are
+    /// excluded from IMAP-publish anyway (sync filter on `series_uid IS
+    /// NOT NULL`), so this is a hard delete with no envelope to emit.
+    /// `ack` returns the row count actually removed.
+    DeleteSeries {
+        series_uid: String,
+        ack: oneshot::Sender<Result<usize, DbError>>,
+    },
     /// Phase-3 negotiation writes. One atomic operation that upserts
     /// the negotiation row, replaces its slot set, and (optionally)
     /// appends a new envelope to the message log. Idempotent on the
@@ -879,6 +888,12 @@ fn dispatch(conn: &mut Connection, cmd: WriteCmd) {
             let _ = ack.send(crate::timeprotocol::store::upsert_commitment(
                 conn,
                 &commitment,
+            ));
+        }
+        WriteCmd::DeleteSeries { series_uid, ack } => {
+            let _ = ack.send(crate::timeprotocol::store::delete_series_by_uid(
+                conn,
+                &series_uid,
             ));
         }
         WriteCmd::ApplyNegotiationUpdate {

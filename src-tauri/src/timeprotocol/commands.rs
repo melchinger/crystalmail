@@ -257,15 +257,32 @@ pub async fn cal_list_in_range(
 ) -> Result<Vec<Commitment>, String> {
     let state = app.state::<AppState>();
     let db = state.db.get().ok_or("database not ready")?;
-    tauri::async_runtime::spawn_blocking({
+    let from_for_blocking = from.clone();
+    let to_for_blocking = to.clone();
+    let mut rows = tauri::async_runtime::spawn_blocking({
         let db = db.clone();
         move || -> Result<Vec<Commitment>, String> {
             let conn = db.reads.get().map_err(|e| e.to_string())?;
-            store::list_in_range(&conn, &from, &to).map_err(|e| e.to_string())
+            store::list_in_range(&conn, &from_for_blocking, &to_for_blocking)
+                .map_err(|e| e.to_string())
         }
     })
     .await
-    .map_err(|e| format!("cal_list task panicked: {e}"))?
+    .map_err(|e| format!("cal_list task panicked: {e}"))??;
+
+    // Overlay third-party subscription events on top. These never live
+    // in SQLite — `events_in_range` reads them from the in-memory cache
+    // in `subscriptions.rs`. We append + re-sort by start_at so the UI
+    // sees a single chronological list.
+    if let Some(sub_store) = state.subscription_store.get() {
+        let overlay = sub_store.events_in_range(&from, &to).await;
+        if !overlay.is_empty() {
+            rows.extend(overlay);
+            rows.sort_by(|a, b| a.start_at.cmp(&b.start_at));
+        }
+    }
+
+    Ok(rows)
 }
 
 /// Fetch a single commitment with its attendees attached.
@@ -376,6 +393,14 @@ pub async fn cal_update(
         // and publishes the update on the next sync.
         last_published_sequence: existing.last_published_sequence,
         source_message_id: existing.source_message_id,
+        // Series membership is a property of the row, not of the edit —
+        // editing an occurrence keeps it tied to its series.
+        series_uid: existing.series_uid,
+        // Subscription rows are read-only and never reach `cal_update`
+        // / `cal_delete` — the editor refuses these paths in the UI.
+        // Keeping the field at None here matches that contract (and
+        // would self-heal if a row ever slipped through).
+        subscription_id: None,
         created_at: existing.created_at,
         updated_at: chrono::Utc::now(),
     };
@@ -445,6 +470,12 @@ pub async fn cal_delete(app: AppHandle, id: String) -> Result<Commitment, String
         status: CommitmentStatus::Cancelled,
         last_published_sequence: existing.last_published_sequence,
         source_message_id: existing.source_message_id,
+        series_uid: existing.series_uid,
+        // Subscription rows are read-only and never reach `cal_update`
+        // / `cal_delete` — the editor refuses these paths in the UI.
+        // Keeping the field at None here matches that contract (and
+        // would self-heal if a row ever slipped through).
+        subscription_id: None,
         created_at: existing.created_at,
         updated_at: chrono::Utc::now(),
     };
@@ -511,6 +542,138 @@ pub async fn cal_import_ics_attachment(
         .map_err(|e| format!("db upsert: {e}"))?;
     maybe_spawn_mutation_sync(&app, "cal_import_ics_attachment");
     Ok(commitment)
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IcsImportReport {
+    /// VEVENTs that were upserted into the local store.
+    pub imported: usize,
+    /// VEVENTs that the parser produced but we couldn't turn into a
+    /// Commitment — usually missing DTSTART/DTEND. Soft-skipped, not an
+    /// error: VTODO entries and stub events shouldn't block the import.
+    pub skipped: usize,
+    /// Per-event hard errors (writer rejected the upsert, malformed time
+    /// zone, …). The import keeps going past them so a partial bulk import
+    /// still lands what it can; the UI displays the count.
+    pub errors: Vec<String>,
+}
+
+/// Import a user-supplied `.ics` file containing one or more VEVENTs. The
+/// path comes from a Tauri save/open dialog — Tauri's fs-scope check has
+/// already vetted it. We read once, parse all VEVENTs, and upsert by UID
+/// so a re-import refreshes existing rows instead of duplicating them.
+///
+/// Size guard at 8 MiB keeps a stray pointer at a multi-GB file from
+/// OOM'ing us; real calendars (even busy multi-year exports) sit well
+/// under that.
+#[tauri::command]
+pub async fn cal_import_ics_file(
+    app: AppHandle,
+    path: String,
+) -> Result<IcsImportReport, String> {
+    const MAX_ICS_BYTES: usize = 8 * 1024 * 1024;
+
+    let state = app.state::<AppState>();
+    let db = state.db.get().ok_or("database not ready")?;
+
+    // Check size before reading so a typo-pointed-at-a-huge-file (or a
+    // user dropping the wrong path) doesn't load gigabytes into RAM
+    // before we reject it.
+    let metadata = std::fs::metadata(&path).map_err(|e| format!("stat {path}: {e}"))?;
+    if metadata.len() > MAX_ICS_BYTES as u64 {
+        return Err(format!(
+            "ICS file too large ({} bytes, limit {MAX_ICS_BYTES})",
+            metadata.len()
+        ));
+    }
+    let bytes = std::fs::read(&path).map_err(|e| format!("read {path}: {e}"))?;
+
+    let parsed = tauri::async_runtime::spawn_blocking(move || ics::parse_all(&bytes))
+        .await
+        .map_err(|e| format!("parse task panicked: {e}"))??;
+
+    let mut report = IcsImportReport {
+        imported: 0,
+        skipped: 0,
+        errors: Vec::new(),
+    };
+
+    for ev in parsed {
+        // Expand recurring events into per-occurrence rows. Plain singletons
+        // pass through as a Vec of length 1.
+        let rows = match ics::ics_to_commitments(&ev, None, None, None) {
+            Ok(rs) if rs.is_empty() => {
+                report.skipped += 1;
+                continue;
+            }
+            Ok(rs) => rs,
+            Err(_) => {
+                // VTODO, VFREEBUSY, VEVENT without DTSTART/DTEND, or a
+                // malformed RRULE. The user gets a count of skips; the
+                // specific reason isn't actionable.
+                report.skipped += 1;
+                continue;
+            }
+        };
+        // Track whether this VEVENT's series was added at-least-once so
+        // the cleanup-of-old-occurrences path (if we add one later) has
+        // an anchor. Right now we just upsert per-occurrence-UID; stale
+        // rows from a previous import outside the new window survive
+        // until the user clears the series manually — accepted tradeoff
+        // documented at the call site in CalendarView.
+        for commitment in rows {
+            let occ_uid = commitment.uid.clone();
+            let (tx, rx) = oneshot::channel();
+            db.writer
+                .send(WriteCmd::UpsertCommitment {
+                    commitment,
+                    ack: tx,
+                })
+                .await
+                .map_err(|_| "writer channel closed".to_string())?;
+            match rx
+                .await
+                .map_err(|_| "writer dropped ack".to_string())?
+            {
+                Ok(()) => report.imported += 1,
+                Err(e) => report.errors.push(format!("{occ_uid}: {e}")),
+            }
+        }
+    }
+
+    if report.imported > 0 {
+        maybe_spawn_mutation_sync(&app, "cal_import_ics_file");
+    }
+
+    Ok(report)
+}
+
+/// Cascade-delete every occurrence row that shares a `series_uid`. The
+/// UI hands us the master UID of an expanded RRULE series; we wipe the
+/// whole series in one transaction. No IMAP cancellation is emitted —
+/// series rows are excluded from the publish path (sync.rs filter), so
+/// nothing went out to begin with.
+#[tauri::command]
+pub async fn cal_cancel_series(
+    app: AppHandle,
+    series_uid: String,
+) -> Result<usize, String> {
+    let state = app.state::<AppState>();
+    let db = state.db.get().ok_or("database not ready")?;
+    let (tx, rx) = oneshot::channel();
+    db.writer
+        .send(WriteCmd::DeleteSeries {
+            series_uid,
+            ack: tx,
+        })
+        .await
+        .map_err(|_| "writer channel closed")?;
+    let removed = rx
+        .await
+        .map_err(|_| "writer dropped ack".to_string())?
+        .map_err(|e| format!("db delete series: {e}"))?;
+    Ok(removed)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1271,6 +1434,10 @@ async fn materialize_commitment_if_confirmed(
         status: CommitmentStatus::Confirmed,
         last_published_sequence: None,
         source_message_id: None,
+        // Negotiated events are stand-alone — RRULE-series imports live
+        // strictly in the file-import path.
+        series_uid: None,
+        subscription_id: None,
         created_at: now,
         updated_at: now,
     };
@@ -1335,4 +1502,99 @@ fn own_email_for_thread(neg: &Negotiation) -> String {
                 .map(|s| s.to_string())
         })
         .unwrap_or_default()
+}
+
+// ─── Phase 3+: third-party iCal subscriptions ────────────────────────────
+
+use super::subscriptions::{
+    CalendarSubscription, RefreshReport, SubscriptionSource,
+};
+
+fn subscription_store(
+    app: &AppHandle,
+) -> Result<std::sync::Arc<super::subscriptions::SubscriptionStore>, String> {
+    app.state::<AppState>()
+        .subscription_store
+        .get()
+        .cloned()
+        .ok_or_else(|| "subscription store not ready".to_string())
+}
+
+/// Snapshot of the user's subscriptions for the settings panel.
+#[tauri::command]
+pub async fn cal_subs_list(app: AppHandle) -> Result<Vec<CalendarSubscription>, String> {
+    Ok(subscription_store(&app)?.list().await)
+}
+
+/// Add a new subscription. The first refresh runs in the background via
+/// the periodic task; the caller gets the freshly-minted record back so
+/// the UI can show it with `last_refreshed = null` until then. (Tighten
+/// this later if the UX warrants kicking an immediate refresh.)
+#[tauri::command]
+pub async fn cal_subs_add(
+    app: AppHandle,
+    name: String,
+    source: SubscriptionSource,
+    refresh_interval_minutes: u32,
+) -> Result<CalendarSubscription, String> {
+    let store = subscription_store(&app)?;
+    let sub = store.add(name, source, refresh_interval_minutes).await?;
+    // Kick a refresh so the user doesn't sit staring at "no events yet"
+    // for up to a minute. Result is ignored — the report goes into the
+    // record's last_error / last_event_count for the UI to display.
+    let id = sub.id.clone();
+    tauri::async_runtime::spawn(async move {
+        store.refresh(&id).await;
+    });
+    Ok(sub)
+}
+
+#[tauri::command]
+pub async fn cal_subs_remove(app: AppHandle, id: String) -> Result<(), String> {
+    subscription_store(&app)?.remove(&id).await
+}
+
+#[tauri::command]
+pub async fn cal_subs_set_enabled(
+    app: AppHandle,
+    id: String,
+    enabled: bool,
+) -> Result<CalendarSubscription, String> {
+    subscription_store(&app)?.set_enabled(&id, enabled).await
+}
+
+#[tauri::command]
+pub async fn cal_subs_set_interval(
+    app: AppHandle,
+    id: String,
+    minutes: u32,
+) -> Result<CalendarSubscription, String> {
+    subscription_store(&app)?.set_interval(&id, minutes).await
+}
+
+/// Manual-refresh button for a single subscription. Returns a status
+/// report instead of `Err` for normal "fetch failed" cases so the UI
+/// can show "✗ HTTP 503" without a modal.
+#[tauri::command]
+pub async fn cal_subs_refresh(app: AppHandle, id: String) -> Result<RefreshReport, String> {
+    Ok(subscription_store(&app)?.refresh(&id).await)
+}
+
+/// Refresh every enabled subscription whose interval has elapsed. Used
+/// by the "Sync all" toolbar button.
+#[tauri::command]
+pub async fn cal_subs_refresh_all(app: AppHandle) -> Result<Vec<RefreshReport>, String> {
+    Ok(subscription_store(&app)?.refresh_all_due().await)
+}
+
+/// Set the per-calendar tint shown on event bars in the week/month
+/// views. Expects a `#rrggbb` hex string; rejects anything else so the
+/// UI's contrast assumptions hold.
+#[tauri::command]
+pub async fn cal_subs_set_color(
+    app: AppHandle,
+    id: String,
+    color: String,
+) -> Result<CalendarSubscription, String> {
+    subscription_store(&app)?.set_color(&id, color).await
 }
