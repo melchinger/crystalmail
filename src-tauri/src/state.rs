@@ -269,6 +269,15 @@ pub struct AppState {
     /// landen *nicht* hier — der Puffer ist nur für die
     /// Cold-Start-Race da.
     pub pending_import_drafts: std::sync::Mutex<Vec<crate::application::draft_import::PreparedImportDraft>>,
+    /// Read-only third-party iCal subscriptions overlay. Lazily filled
+    /// in the Tauri setup hook (we need `AppHandle::path()` to know
+    /// where to put the on-disk cache, which isn't available in
+    /// `AppState::default`). Once present, holds the persisted list +
+    /// the in-memory parsed-event cache. Lookups from
+    /// `cal_list_in_range` merge with this overlay on top of SQLite.
+    pub subscription_store: tokio::sync::OnceCell<
+        std::sync::Arc<crate::timeprotocol::subscriptions::SubscriptionStore>,
+    >,
 }
 
 impl Default for AppState {
@@ -289,6 +298,7 @@ impl Default for AppState {
             workflow_training_cancel_requested: AtomicBool::new(false),
             actor_handles: Mutex::new(HashMap::new()),
             pending_import_drafts: std::sync::Mutex::new(Vec::new()),
+            subscription_store: tokio::sync::OnceCell::new(),
         }
     }
 }

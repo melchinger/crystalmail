@@ -15,6 +15,7 @@ import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import type { Commitment, CommitmentDraft, ExportedIcs } from "../types";
+import { isAllDayEvent } from "../utils/calendarEvent";
 
 type Props = {
   mode: "create" | "edit";
@@ -34,8 +35,17 @@ type FormState = {
   summary: string;
   location: string;
   description: string;
-  /** datetime-local string: "YYYY-MM-DDTHH:MM". */
+  /** Toggle: when true, start/end are interpreted as plain dates
+   *  (`YYYY-MM-DD`); when false they're datetime-local
+   *  (`YYYY-MM-DDTHH:MM`). The input controls swap based on this. */
+  allDay: boolean;
+  /** Form value of the start input. Format depends on `allDay`. */
   startLocal: string;
+  /** Form value of the end input. For `allDay`, this is the **inclusive
+   *  end date** — the day the event is last visible. Conversion to the
+   *  RFC-5545-style exclusive end (next-day midnight) happens at save
+   *  time so the user-facing semantics match Outlook / Google
+   *  ("23. bis 23." = one day). */
   endLocal: string;
 };
 
@@ -43,6 +53,7 @@ const EMPTY: FormState = {
   summary: "",
   location: "",
   description: "",
+  allDay: false,
   startLocal: defaultStartLocal(),
   endLocal: defaultEndLocal(),
 };
@@ -91,12 +102,21 @@ export function EventEditor({
           return;
         }
         setLoaded(c);
+        const allDay = isAllDayEvent(c);
         setForm({
           summary: c.summary ?? "",
           location: c.location ?? "",
           description: c.description ?? "",
-          startLocal: rfc3339ToLocalDateTime(c.startAt),
-          endLocal: rfc3339ToLocalDateTime(c.endAt),
+          allDay,
+          startLocal: allDay
+            ? rfc3339ToLocalDate(c.startAt)
+            : rfc3339ToLocalDateTime(c.startAt),
+          // All-day events store an *exclusive* end (next midnight) —
+          // step back one day for the inclusive UI form. A 1-day event
+          // (start = 23.04 00:00, end = 24.04 00:00) renders as 23.→23.
+          endLocal: allDay
+            ? rfc3339ToLocalDate(addDays(c.endAt, -1))
+            : rfc3339ToLocalDateTime(c.endAt),
         });
       } catch (e) {
         if (!cancelled) setError(String(e));
@@ -109,6 +129,11 @@ export function EventEditor({
 
   const submit = async () => {
     if (busy) return;
+    if (loaded?.subscriptionId) {
+      // Belt-and-braces: the save button is hidden in this branch, but
+      // a stray Enter on a form field would otherwise still fire submit.
+      return;
+    }
     if (!form.startLocal || !form.endLocal) {
       setError(t("calendar.editor.missingTime"));
       return;
@@ -120,12 +145,22 @@ export function EventEditor({
     setBusy(true);
     setError(null);
     try {
+      // Two conversion paths share the rest of the draft. All-day:
+      // start = picked-date 00:00 local, end = (picked-end + 1d) 00:00
+      // local — the +1d turns the user's inclusive end date into the
+      // RFC-5545-exclusive next-midnight the storage layer expects.
+      const startAt = form.allDay
+        ? localDateToRfc3339Midnight(form.startLocal)
+        : localDateTimeToRfc3339(form.startLocal);
+      const endAt = form.allDay
+        ? localDateToRfc3339Midnight(addDaysToDateString(form.endLocal, 1))
+        : localDateTimeToRfc3339(form.endLocal);
       const draft: CommitmentDraft = {
         summary: form.summary.trim() || null,
         location: form.location.trim() || null,
         description: form.description.trim() || null,
-        startAt: localDateTimeToRfc3339(form.startLocal),
-        endAt: localDateTimeToRfc3339(form.endLocal),
+        startAt,
+        endAt,
         originalTzid: loaded?.originalTzid ?? null,
         organizer: loaded?.organizer ?? null,
         attendees: loaded?.attendees ?? [],
@@ -155,6 +190,24 @@ export function EventEditor({
       // future Phase-2 IMAP-publish can still emit the cancellation
       // envelope with the right counter.
       await invoke<Commitment>("cal_delete", { id: commitmentId });
+      onDeleted();
+    } catch (e) {
+      setError(String(e));
+      setBusy(false);
+    }
+  };
+
+  const handleCancelSeries = async () => {
+    if (!loaded?.seriesUid || busy) return;
+    if (!window.confirm(t("calendar.editor.confirmCancelSeries"))) return;
+    setBusy(true);
+    try {
+      // Hard-deletes all occurrences sharing this series_uid (no IMAP
+      // envelope — series rows are excluded from publish, so nothing
+      // remote to cancel).
+      await invoke<number>("cal_cancel_series", {
+        seriesUid: loaded.seriesUid,
+      });
       onDeleted();
     } catch (e) {
       setError(String(e));
@@ -217,6 +270,32 @@ export function EventEditor({
             : t("calendar.editor.createTitle")}
         </h3>
 
+        {loaded?.seriesUid && (
+          <div
+            className="mb-3 rounded border px-2 py-1.5 text-xs"
+            style={{
+              borderColor: "var(--border-soft)",
+              background: "var(--bg-soft)",
+              color: "var(--fg-muted)",
+            }}
+          >
+            {t("calendar.editor.seriesHint")}
+          </div>
+        )}
+
+        {loaded?.subscriptionId && (
+          <div
+            className="mb-3 rounded border px-2 py-1.5 text-xs"
+            style={{
+              borderColor: "var(--border-soft)",
+              background: "var(--bg-soft)",
+              color: "var(--fg-muted)",
+            }}
+          >
+            {t("calendar.editor.subscriptionHint")}
+          </div>
+        )}
+
         <form
           className="flex flex-col gap-3"
           onSubmit={(e) => {
@@ -241,10 +320,43 @@ export function EventEditor({
             />
           </Field>
 
+          <label className="flex items-center gap-2 text-xs" style={{ color: "var(--fg-muted)" }}>
+            <input
+              type="checkbox"
+              checked={form.allDay}
+              onChange={(e) => {
+                const allDay = e.target.checked;
+                setForm((f) => {
+                  // Preserve the calendar day across the toggle. Off→on:
+                  // drop the time. On→off: re-attach a sensible default
+                  // (09:00 start, 10:00 end) so the user doesn't have
+                  // to dial both back from midnight.
+                  if (allDay) {
+                    return {
+                      ...f,
+                      allDay: true,
+                      startLocal: f.startLocal.slice(0, 10),
+                      endLocal: f.endLocal.slice(0, 10),
+                    };
+                  }
+                  const startDate = f.startLocal.slice(0, 10);
+                  const endDate = f.endLocal.slice(0, 10);
+                  return {
+                    ...f,
+                    allDay: false,
+                    startLocal: `${startDate}T09:00`,
+                    endLocal: `${endDate}T10:00`,
+                  };
+                });
+              }}
+            />
+            <span>{t("calendar.editor.allDay")}</span>
+          </label>
+
           <div className="flex gap-2">
             <Field label={t("calendar.editor.start")} className="flex-1">
               <input
-                type="datetime-local"
+                type={form.allDay ? "date" : "datetime-local"}
                 value={form.startLocal}
                 onChange={(e) =>
                   setForm((f) => ({ ...f, startLocal: e.target.value }))
@@ -260,7 +372,7 @@ export function EventEditor({
             </Field>
             <Field label={t("calendar.editor.end")} className="flex-1">
               <input
-                type="datetime-local"
+                type={form.allDay ? "date" : "datetime-local"}
                 value={form.endLocal}
                 onChange={(e) =>
                   setForm((f) => ({ ...f, endLocal: e.target.value }))
@@ -294,7 +406,7 @@ export function EventEditor({
 
           <Field label={t("calendar.editor.description")}>
             <textarea
-              rows={3}
+              rows={6}
               value={form.description}
               onChange={(e) =>
                 setForm((f) => ({ ...f, description: e.target.value }))
@@ -304,6 +416,8 @@ export function EventEditor({
                 borderColor: "var(--border-soft)",
                 background: "var(--bg-base)",
                 color: "var(--fg-base)",
+                resize: "vertical",
+                fontFamily: "inherit",
               }}
             />
           </Field>
@@ -335,19 +449,38 @@ export function EventEditor({
                 >
                   {t("calendar.editor.exportIcs")}
                 </button>
-                <button
-                  type="button"
-                  onClick={() => void handleDelete()}
-                  className="rounded px-3 py-1 text-xs"
-                  style={{
-                    background: "var(--bg-soft)",
-                    color: "var(--fg-error, #c00)",
-                    border: "1px solid var(--border-soft)",
-                  }}
-                  disabled={busy}
-                >
-                  {t("calendar.editor.delete")}
-                </button>
+                {!loaded?.subscriptionId && (
+                  <button
+                    type="button"
+                    onClick={() => void handleDelete()}
+                    className="rounded px-3 py-1 text-xs"
+                    style={{
+                      background: "var(--bg-soft)",
+                      color: "var(--fg-error, #c00)",
+                      border: "1px solid var(--border-soft)",
+                    }}
+                    disabled={busy}
+                  >
+                    {loaded?.seriesUid
+                      ? t("calendar.editor.deleteOccurrence")
+                      : t("calendar.editor.delete")}
+                  </button>
+                )}
+                {loaded?.seriesUid && (
+                  <button
+                    type="button"
+                    onClick={() => void handleCancelSeries()}
+                    className="rounded px-3 py-1 text-xs"
+                    style={{
+                      background: "var(--bg-soft)",
+                      color: "var(--fg-error, #c00)",
+                      border: "1px solid var(--border-soft)",
+                    }}
+                    disabled={busy}
+                  >
+                    {t("calendar.editor.cancelSeries")}
+                  </button>
+                )}
               </>
             )}
             <button
@@ -441,6 +574,38 @@ function localDateTimeToRfc3339(local: string): string {
 function rfc3339ToLocalDateTime(rfc: string): string {
   const d = new Date(rfc);
   return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}T${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
+
+/** Date-only twin of `rfc3339ToLocalDateTime`. Format expected by an
+ *  `<input type="date">`: `YYYY-MM-DD`. */
+function rfc3339ToLocalDate(rfc: string): string {
+  const d = new Date(rfc);
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+
+/** Convert a date-input string (`YYYY-MM-DD`) to an RFC 3339 timestamp
+ *  at local midnight with the system's TZ offset. Mirror of
+ *  `localDateTimeToRfc3339` for the all-day case. */
+function localDateToRfc3339Midnight(localDate: string): string {
+  return localDateTimeToRfc3339(`${localDate}T00:00`);
+}
+
+/** Shift a `YYYY-MM-DD` string by `days` calendar days. Negative values
+ *  step back. Used to translate between the user-facing inclusive end
+ *  date and the RFC-5545-style exclusive end. */
+function addDaysToDateString(localDate: string, days: number): string {
+  const d = new Date(`${localDate}T00:00:00`);
+  d.setDate(d.getDate() + days);
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+
+/** Shift an RFC 3339 timestamp by `days` calendar days, preserving the
+ *  offset/time-of-day. Used by the load path: stored end is exclusive,
+ *  UI form wants inclusive. */
+function addDays(rfc: string, days: number): string {
+  const d = new Date(rfc);
+  d.setDate(d.getDate() + days);
+  return d.toISOString();
 }
 
 /** Default start = next-rounded-half-hour today (or tomorrow if past 23:30). */

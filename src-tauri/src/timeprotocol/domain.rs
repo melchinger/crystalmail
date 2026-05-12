@@ -49,6 +49,13 @@ pub struct ParsedIcsEvent {
     /// did not carry STATUS (legacy invitations from non-profile senders).
     #[serde(default)]
     pub status: Option<String>,
+    /// Raw RRULE property value when present (the part *after* `RRULE:`,
+    /// e.g. `FREQ=WEEKLY;BYDAY=MO,WE;COUNT=10`). Drives the on-import
+    /// expansion of the series into individual occurrences. `None` for
+    /// stand-alone events. RDATE/EXDATE/RECURRENCE-ID overrides are
+    /// intentionally not surfaced — Phase 3+ scope is plain RRULE.
+    #[serde(default)]
+    pub rrule: Option<String>,
 }
 
 /// Outgoing reply intent. Maps 1:1 to RFC 5545 PARTSTAT values.
@@ -213,6 +220,21 @@ pub struct Commitment {
     /// imported from. Not an FK in the db schema (the message may be
     /// deleted later, the commitment should survive).
     pub source_message_id: Option<String>,
+    /// RRULE-expansion marker. When `Some(master_uid)`, this row is one
+    /// individual occurrence of a recurring series — its own `uid` is a
+    /// synthetic `${series_uid}@${dtstart_iso}` and a "cancel whole
+    /// series" UI action cascade-deletes everything that shares this
+    /// value. `None` means a stand-alone event (manual create or a
+    /// singleton import).
+    #[serde(default)]
+    pub series_uid: Option<String>,
+    /// Subscribed-calendar marker. Set on rows that come from a
+    /// third-party iCal subscription overlay (read-only, never written
+    /// to the `commitments` table — surfaces only through the in-memory
+    /// merge in `cal_list_in_range`). The frontend keys read-only UI
+    /// off this field. `None` for everything that lives in SQLite.
+    #[serde(default)]
+    pub subscription_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

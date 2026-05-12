@@ -31,7 +31,7 @@ pub fn list_in_range(
                 start_at, end_at, original_tzid,
                 organizer_email, organizer_name,
                 source, source_message_id, created_at, updated_at, status,
-                last_published_sequence
+                last_published_sequence, series_uid
          FROM commitments
          WHERE start_at < ?2 AND end_at > ?1
            AND status != 'CANCELLED'
@@ -56,7 +56,7 @@ pub fn get_with_attendees(
                 start_at, end_at, original_tzid,
                 organizer_email, organizer_name,
                 source, source_message_id, created_at, updated_at, status,
-                last_published_sequence
+                last_published_sequence, series_uid
          FROM commitments WHERE id = ?1",
     )?;
     let mut commitment: Option<Commitment> = stmt
@@ -80,7 +80,7 @@ pub fn list_all_with_attendees(
                 start_at, end_at, original_tzid,
                 organizer_email, organizer_name,
                 source, source_message_id, created_at, updated_at, status,
-                last_published_sequence
+                last_published_sequence, series_uid
          FROM commitments
          ORDER BY uid ASC",
     )?;
@@ -112,7 +112,7 @@ pub fn get_by_uid(
                 start_at, end_at, original_tzid,
                 organizer_email, organizer_name,
                 source, source_message_id, created_at, updated_at, status,
-                last_published_sequence
+                last_published_sequence, series_uid
          FROM commitments WHERE uid = ?1",
     )?;
     let mut commitment: Option<Commitment> = stmt
@@ -168,6 +168,7 @@ fn row_to_commitment_no_attendees(
     let status = CommitmentStatus::from_str(&status_str)
         .unwrap_or(CommitmentStatus::Confirmed);
     let last_published_sequence: Option<i64> = row.get(16)?;
+    let series_uid: Option<String> = row.get(17)?;
     Ok(Commitment {
         id: row.get(0)?,
         uid: row.get(1)?,
@@ -184,6 +185,10 @@ fn row_to_commitment_no_attendees(
         status,
         last_published_sequence: last_published_sequence.map(|n| n as u32),
         source_message_id: row.get(12)?,
+        series_uid,
+        // The DB has no subscription_id column — these rows always
+        // come from SQLite, never the subscription overlay.
+        subscription_id: None,
         created_at: parse_utc(&created_at),
         updated_at: parse_utc(&updated_at),
     })
@@ -233,8 +238,8 @@ pub fn upsert_commitment(
              start_at, end_at, original_tzid,
              organizer_email, organizer_name,
              source, source_message_id, created_at, updated_at, status,
-             last_published_sequence)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+             last_published_sequence, series_uid)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
          ON CONFLICT(id) DO UPDATE SET
             uid                     = excluded.uid,
             sequence                = excluded.sequence,
@@ -250,7 +255,8 @@ pub fn upsert_commitment(
             source_message_id       = excluded.source_message_id,
             updated_at              = excluded.updated_at,
             status                  = excluded.status,
-            last_published_sequence = excluded.last_published_sequence",
+            last_published_sequence = excluded.last_published_sequence,
+            series_uid              = excluded.series_uid",
         params![
             target_id,
             commitment.uid,
@@ -269,6 +275,7 @@ pub fn upsert_commitment(
             commitment.updated_at.to_rfc3339(),
             commitment.status.as_str(),
             commitment.last_published_sequence.map(|n| n as i64),
+            commitment.series_uid,
         ],
     )?;
 
@@ -288,5 +295,35 @@ pub fn upsert_commitment(
 
     tx.commit()?;
     Ok(())
+}
+
+/// Hard-delete every row whose `series_uid` matches. Used when the user
+/// chooses "ganze Serie absagen" on an RRULE-expanded occurrence. We hard
+/// delete instead of marking CANCELLED because series rows are excluded
+/// from IMAP publish anyway (see `sync.rs`) — there's no cancellation
+/// envelope to emit, so a tombstone would just clutter the table.
+/// Attendees cascade via the FK on `commitment_attendees.commitment_id`.
+/// Returns the row count actually removed.
+pub fn delete_series_by_uid(
+    conn: &mut Connection,
+    series_uid: &str,
+) -> Result<usize, DbError> {
+    let tx = conn.transaction()?;
+    // Drop attendees first — the schema doesn't declare ON DELETE CASCADE
+    // (Phase-1 store.rs doesn't), so we sweep them by hand inside the
+    // same transaction.
+    tx.execute(
+        "DELETE FROM commitment_attendees
+         WHERE commitment_id IN (
+            SELECT id FROM commitments WHERE series_uid = ?1
+         )",
+        params![series_uid],
+    )?;
+    let n = tx.execute(
+        "DELETE FROM commitments WHERE series_uid = ?1",
+        params![series_uid],
+    )?;
+    tx.commit()?;
+    Ok(n)
 }
 

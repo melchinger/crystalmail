@@ -31,4 +31,5 @@ pub mod ics;
 pub mod negotiation_engine;
 pub mod negotiation_store;
 pub mod store;
+pub mod subscriptions;
 pub mod sync;

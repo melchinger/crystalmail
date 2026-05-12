@@ -12,7 +12,13 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
-import type { CalendarSyncReport, Commitment } from "../types";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import type {
+  CalendarSubscription,
+  CalendarSyncReport,
+  Commitment,
+  IcsImportReport,
+} from "../types";
 import { CalendarMonthView } from "./CalendarMonthView";
 import { CalendarWeekView } from "./CalendarWeekView";
 import { EventEditor } from "./EventEditor";
@@ -33,6 +39,11 @@ type Bucket = "past" | "today" | "thisWeek" | "later";
 export function CalendarView() {
   const { t } = useTranslation();
   const [events, setEvents] = useState<Commitment[] | null>(null);
+  // Subscriptions are loaded alongside events so the views can tint
+  // each bar by its source calendar. We only need the colors at render
+  // time, but we hold the full record so a later expansion (per-source
+  // toggles, status icons, …) doesn't need a second round-trip.
+  const [subscriptions, setSubscriptions] = useState<CalendarSubscription[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [editor, setEditor] = useState<EditorState>(null);
   const [showPast, setShowPast] = useState(false);
@@ -70,11 +81,19 @@ export function CalendarView() {
       from.setMonth(from.getMonth() - 12);
       const to = new Date(now);
       to.setMonth(to.getMonth() + 12);
-      const rows = await invoke<Commitment[]>("cal_list_in_range", {
-        from: from.toISOString(),
-        to: to.toISOString(),
-      });
+      const [rows, subs] = await Promise.all([
+        invoke<Commitment[]>("cal_list_in_range", {
+          from: from.toISOString(),
+          to: to.toISOString(),
+        }),
+        invoke<CalendarSubscription[]>("cal_subs_list").catch(() =>
+          // Subs are an enhancement, not a hard dep — the view should
+          // still render if the store hasn't initialised yet.
+          [] as CalendarSubscription[],
+        ),
+      ]);
       setEvents(rows);
+      setSubscriptions(subs);
       setError(null);
     } catch (e) {
       setError(String(e));
@@ -85,6 +104,39 @@ export function CalendarView() {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  const handleImportFile = useCallback(async () => {
+    try {
+      const picked = await openDialog({
+        multiple: false,
+        directory: false,
+        filters: [{ name: "iCalendar", extensions: ["ics", "ICS"] }],
+      });
+      if (!picked) return;
+      // openDialog returns `string | string[] | null` depending on options.
+      // With `multiple: false` it's `string | null`, but the typing widens
+      // — narrow defensively.
+      const path = Array.isArray(picked) ? picked[0] : picked;
+      if (!path) return;
+      const report = await invoke<IcsImportReport>("cal_import_ics_file", {
+        path,
+      });
+      setSyncStatus(
+        t("calendar.list.importDone", {
+          imported: report.imported,
+          skipped: report.skipped,
+          errors: report.errors.length,
+        }),
+      );
+      await refresh();
+      if (report.errors.length > 0) {
+        // eslint-disable-next-line no-console
+        console.warn("ics import errors:", report.errors);
+      }
+    } catch (e) {
+      setSyncStatus(`✗ ${String(e)}`);
+    }
+  }, [refresh, t]);
 
   const handleSync = useCallback(async () => {
     if (syncing) return;
@@ -117,6 +169,16 @@ export function CalendarView() {
   }, [refresh, syncing, t]);
 
   const grouped = useMemo(() => groupByBucket(events ?? []), [events]);
+
+  /** Indexed view of subscriptions, passed to the grid views so they
+   *  can colorize bars per source calendar with O(1) lookup. */
+  const subscriptionsById = useMemo(
+    () =>
+      new Map(
+        subscriptions.map((s) => [s.id, { color: s.color, name: s.name }]),
+      ),
+    [subscriptions],
+  );
 
   const shiftAnchor = useCallback((step: -1 | 0 | 1) => {
     setAnchorDate((prev) => {
@@ -261,6 +323,19 @@ export function CalendarView() {
           >
             {syncing ? t("calendar.list.syncing") : t("calendar.list.sync")}
           </button>
+          <button
+            type="button"
+            onClick={() => void handleImportFile()}
+            className="rounded px-3 py-1 text-xs"
+            style={{
+              background: "var(--bg-soft)",
+              color: "var(--fg-base)",
+              border: "1px solid var(--border-soft)",
+            }}
+            title={t("calendar.list.importTitle")}
+          >
+            {t("calendar.list.import")}
+          </button>
           {viewMode === "list" && (
             <label
               className="flex items-center gap-1 text-xs"
@@ -350,6 +425,7 @@ export function CalendarView() {
           <CalendarWeekView
             anchorDate={anchorDate}
             events={events}
+            subscriptionsById={subscriptionsById}
             onPickEvent={(id) =>
               setEditor({ mode: "edit", commitmentId: id })
             }
@@ -359,6 +435,7 @@ export function CalendarView() {
           <CalendarMonthView
             anchorDate={anchorDate}
             events={events}
+            subscriptionsById={subscriptionsById}
             onPickEvent={(id) =>
               setEditor({ mode: "edit", commitmentId: id })
             }

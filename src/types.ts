@@ -487,6 +487,15 @@ export type Commitment = {
   /** When `source === "ics_import"`: the message the event was imported
    *  from. Useful to deep-link "view source mail". */
   sourceMessageId: string | null;
+  /** Set when this row is one occurrence of a recurring series expanded
+   *  on import. The value is the master VEVENT's UID; a "cancel whole
+   *  series" UI action cascades on it. `null` means a stand-alone event. */
+  seriesUid: string | null;
+  /** Set on events that come from a third-party iCal subscription
+   *  overlay (read-only, never written to SQLite). The editor refuses
+   *  to save or delete these. `null` for everything that lives in the
+   *  local DB. */
+  subscriptionId: string | null;
   /** ISO 8601 UTC. */
   createdAt: string;
   updatedAt: string;
@@ -511,6 +520,55 @@ export type ExportedIcs = {
   /** Set when the export call also wrote the blob to a path on disk. */
   writtenTo: string | null;
 };
+
+/** Result of `cal_import_ics_file`. `imported` and `skipped` together
+ *  account for every VEVENT the parser produced; `errors` is the subset
+ *  that hit a DB-level problem during upsert (those are NOT counted in
+ *  `imported`). Skips are silent — typically VTODO entries or VEVENTs
+ *  missing DTSTART/DTEND. */
+export type IcsImportReport = {
+  imported: number;
+  skipped: number;
+  errors: string[];
+};
+
+// ─── Phase 3+: third-party iCal subscriptions ─────────────────────────────
+
+/** Where a calendar subscription gets its bytes. Tagged union — `kind`
+ *  selects which of `path` / `url` is used. */
+export type SubscriptionSource =
+  | { kind: "file"; path: string }
+  | { kind: "url"; url: string };
+
+/** Persisted record of one subscription, surfaced to the settings panel. */
+export type CalendarSubscription = {
+  id: string;
+  name: string;
+  source: SubscriptionSource;
+  /** Auto-refresh cadence in minutes. 0 = manual only; otherwise floored
+   *  at 5 by the backend. */
+  refreshIntervalMinutes: number;
+  enabled: boolean;
+  /** Hex color (`#rrggbb`) used to tint this calendar's events in the
+   *  week/month views. Assigned by round-robin from a fixed palette on
+   *  add; user-editable in the settings panel. */
+  color: string;
+  /** ISO 8601 UTC of the last completed refresh (success or 304). */
+  lastRefreshed: string | null;
+  /** Error from the most recent failed refresh; cleared on success. */
+  lastError: string | null;
+  /** Event count from the last successful parse. */
+  lastEventCount: number | null;
+  etag: string | null;
+  lastModified: string | null;
+  createdAt: string;
+};
+
+/** Outcome of a refresh attempt. Tagged on `outcome`. */
+export type RefreshReport =
+  | { outcome: "updated"; subscriptionId: string; eventCount: number }
+  | { outcome: "notModified"; subscriptionId: string }
+  | { outcome: "failed"; subscriptionId: string; error: string };
 
 // ─── Phase 2: IMAP-Folder-Sync per ADR-0011 ──────────────────────────────
 

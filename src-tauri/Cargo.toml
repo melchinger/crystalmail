@@ -58,6 +58,22 @@ mail-parser = "0.9"
 # attachments — outgoing REPLY ICS is hand-built (small, well-defined shape,
 # avoids depending on the crate's writer surface).
 ical = { version = "0.10", default-features = false, features = ["ical"] }
+# RFC 5545 RRULE expander for recurring imported events (Phase 3+). Pulls
+# in chrono-tz transitively for IANA-aware time arithmetic — needed so
+# weekly events that cross a DST boundary keep firing at the right wall
+# clock time. We use it strictly on the import path; outgoing CrystalMail
+# events stay non-recurring (RRULE round-trip is out of scope).
+rrule = "0.13"
+# HTTP client for read-only iCal/webcal calendar subscriptions. We use
+# rustls (matches the rest of the TLS stack — no native-tls / OpenSSL
+# duplication) and explicitly disable cookie/proxy/charset goop we don't
+# need. `gzip` is on by default; left enabled because public iCal feeds
+# routinely serve gzipped 1-5 MB bundles.
+reqwest = { version = "0.12", default-features = false, features = [
+  "rustls-tls",
+  "gzip",
+  "http2",
+] }
 
 # ── Local store (SQLite) + full-text search via FTS5 ──────────────────────────
 # Encrypted-at-rest via SQLCipher. The `bundled-sqlcipher-vendored-openssl`

@@ -245,6 +245,37 @@ fn main() {
                 application::calendar_actor::reconcile(&cal_handle).await;
             });
 
+            // Third-party calendar subscriptions overlay. Loads the
+            // persisted list + warms the in-memory event cache from
+            // any `.ics` files left over from previous runs (so the
+            // calendar shows subscribed events immediately on launch),
+            // then spawns a 60s-tick background refresh that re-fetches
+            // sources whose `refresh_interval_minutes` has elapsed.
+            let sub_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                use tauri::Manager;
+                let data_dir = match sub_handle.path().app_data_dir() {
+                    Ok(d) => d,
+                    Err(e) => {
+                        tracing::warn!("subscription store: no app_data_dir: {e}");
+                        return;
+                    }
+                };
+                let cache_dir = sub_handle
+                    .path()
+                    .app_cache_dir()
+                    .unwrap_or_else(|_| data_dir.clone());
+                let store = std::sync::Arc::new(
+                    timeprotocol::subscriptions::SubscriptionStore::load(
+                        data_dir, cache_dir,
+                    )
+                    .await,
+                );
+                let state = sub_handle.state::<state::AppState>();
+                let _ = state.subscription_store.set(store.clone());
+                timeprotocol::subscriptions::spawn_background_refresh(store);
+            });
+
             // Cold-Start-Argv: wurde die App vom OS direkt mit einem
             // `--draft-from-template`-Trigger gestartet (z.B. weil der
             // User aus einem Python-Script heraus `crystalmail.exe …`
@@ -374,6 +405,16 @@ fn main() {
             timeprotocol::commands::cal_update,
             timeprotocol::commands::cal_delete,
             timeprotocol::commands::cal_import_ics_attachment,
+            timeprotocol::commands::cal_import_ics_file,
+            timeprotocol::commands::cal_cancel_series,
+            timeprotocol::commands::cal_subs_list,
+            timeprotocol::commands::cal_subs_add,
+            timeprotocol::commands::cal_subs_remove,
+            timeprotocol::commands::cal_subs_set_enabled,
+            timeprotocol::commands::cal_subs_set_interval,
+            timeprotocol::commands::cal_subs_refresh,
+            timeprotocol::commands::cal_subs_refresh_all,
+            timeprotocol::commands::cal_subs_set_color,
             timeprotocol::commands::cal_export_to_ics,
             timeprotocol::commands::cal_get_config,
             timeprotocol::commands::cal_set_config,
