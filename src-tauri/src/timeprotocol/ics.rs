@@ -948,12 +948,17 @@ END:VCALENDAR\r\n";
         .expect("expand");
         assert_eq!(rows.len(), 5);
         // Every row carries the master's UID as series_uid and a unique
-        // synthetic UID of its own.
-        let mut seen = std::collections::HashSet::new();
+        // synthetic UID of its own. Build the unique-set in one pass and
+        // compare cardinality — keeps the assertion message free of the
+        // raw UID values (CodeQL flags `format!("…{uid}")` as cleartext
+        // logging of sensitive data; false positive for RFC-5545 event
+        // UIDs but the rewrite is cheap).
+        let unique_uids: std::collections::HashSet<&str> =
+            rows.iter().map(|r| r.uid.as_str()).collect();
+        assert_eq!(unique_uids.len(), rows.len(), "duplicate uid in series");
         for row in &rows {
             assert_eq!(row.series_uid.as_deref(), Some("weekly@example.com"));
             assert!(row.uid.starts_with("weekly@example.com@"));
-            assert!(seen.insert(row.uid.clone()), "duplicate uid {}", row.uid);
             assert_eq!(row.summary.as_deref(), Some("Weekly Sync"));
         }
         // First occurrence is the DTSTART itself; the fifth is +4 weeks.
