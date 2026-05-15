@@ -31,6 +31,17 @@ type Props = {
   placeholder?: string;
   minHeight?: number;
   onChange?: () => void;
+  /** Hook invoked when the user pastes an image from the clipboard.
+   *  Compose is expected to persist the bytes (temp file via Tauri),
+   *  register it as an inline attachment, and return a `contentId` to
+   *  reference in `<img src="cid:…">` plus a `previewUrl` (blob:) for
+   *  immediate in-editor display. If absent or returning `null`, the
+   *  image paste is silently dropped and we fall back to text-paste
+   *  (which yields nothing for an image-only clipboard). */
+  onPasteImage?: (file: File) => Promise<{
+    contentId: string;
+    previewUrl: string;
+  } | null>;
 };
 
 /**
@@ -40,7 +51,7 @@ type Props = {
  * If we ever need tables or collaborative editing we can swap it then.
  */
 export const RichEditor = forwardRef<RichEditorHandle, Props>(function RichEditor(
-  { initialHtml, placeholder, minHeight = 220, onChange },
+  { initialHtml, placeholder, minHeight = 220, onChange, onPasteImage },
   ref,
 ) {
   const rootRef = useRef<HTMLDivElement>(null);
@@ -128,6 +139,48 @@ export const RichEditor = forwardRef<RichEditorHandle, Props>(function RichEdito
         data-placeholder={placeholder}
         onInput={onChange}
         onPaste={(e) => {
+          // Image paste takes precedence over text. Outlook/Word also put
+          // a text/plain fallback ("Inline-image") alongside the image
+          // when copying out of a mail; without this check we'd never
+          // reach the image branch.
+          if (onPasteImage) {
+            const items = e.clipboardData.items;
+            let imageFile: File | null = null;
+            for (let i = 0; i < items.length; i++) {
+              const it = items[i];
+              if (it.kind === "file" && it.type.startsWith("image/")) {
+                imageFile = it.getAsFile();
+                break;
+              }
+            }
+            if (imageFile) {
+              e.preventDefault();
+              // Snapshot the editor element synchronously — by the time
+              // the await resolves React may have re-rendered or the user
+              // may have clicked elsewhere; we still want the insert to
+              // land in this editor instance.
+              const editor = rootRef.current;
+              onPasteImage(imageFile).then((result) => {
+                if (!result || !editor) return;
+                // Restore caret to the editor (the await may have stolen
+                // focus, depending on Tauri dialog usage downstream).
+                editor.focus();
+                const safeCid = result.contentId.replace(/[^a-zA-Z0-9._\-@]/g, "");
+                const safeUrl = result.previewUrl.replace(/"/g, "&quot;");
+                // `data-cid` survives the round-trip through the editor's
+                // innerHTML — Send-time rewriting in `buildSendRequest`
+                // swaps `src=blob:…` for `src=cid:CID` using exactly this
+                // attribute as the lookup key.
+                const html = `<img src="${safeUrl}" data-cid="${safeCid}" alt="" style="max-width: 100%;">`;
+                document.execCommand("insertHTML", false, html);
+                // execCommand sometimes skips the `input` event when the
+                // insertion happens after an async gap; nudge onChange so
+                // the dirty-flag in Compose flips.
+                onChange?.();
+              });
+              return;
+            }
+          }
           // Paste as plain text by default so we don't import Word/Outlook
           // styles that clash with our inline styles. Users can still use
           // Ctrl+V for rich paste by holding Shift (browser default) — no,

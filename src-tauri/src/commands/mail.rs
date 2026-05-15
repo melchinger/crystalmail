@@ -537,6 +537,78 @@ pub async fn save_draft(
     smtp::save_as_draft(db, request).await
 }
 
+/// Persist clipboard image bytes to a temp file so the composer can
+/// reference them as a normal file-path attachment afterwards.
+///
+/// Called from the rich-text editor's onPaste handler when the
+/// clipboard carries an `image/*` item. We deliberately funnel this
+/// through a path-based attachment (rather than a base64-in-JSON inline
+/// payload all the way through to SMTP) to stay consistent with how
+/// file-picker attachments are handled — same code path in `build_message`,
+/// same on-disk read at send time, no special-case branch for
+/// "memory-only" attachments.
+///
+/// The temp file lives in `temp_dir()/crystalmail-pasted/<uuid>.<ext>`.
+/// We don't auto-clean these up — the OS prunes the system temp dir
+/// periodically, and a paste-but-don't-send leak is bounded by the
+/// images the user actually paste-cancels (rare in practice).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PastedImage {
+    pub path: String,
+    pub filename: String,
+    pub mime_type: String,
+    pub size_bytes: u64,
+}
+
+#[tauri::command]
+pub async fn save_clipboard_image(
+    bytes: Vec<u8>,
+    mime_type: String,
+) -> Result<PastedImage, String> {
+    // Refuse silly-large pastes outright — 32 MB is way over any
+    // sensible screenshot or photo, and limiting the upper bound here
+    // avoids OOM-ing the process if a misbehaving client hands us a
+    // multi-GB clipboard payload.
+    const MAX: usize = 32 * 1024 * 1024;
+    if bytes.len() > MAX {
+        return Err(format!(
+            "Bild zu groß ({} MB, Maximum: 32 MB).",
+            bytes.len() / 1024 / 1024
+        ));
+    }
+    let ext = ext_for_mime(&mime_type);
+    let dir = std::env::temp_dir().join("crystalmail-pasted");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("Temp-Ordner anlegen: {e}"))?;
+    let filename = format!("pasted-{}.{}", uuid::Uuid::new_v4().simple(), ext);
+    let path = dir.join(&filename);
+    std::fs::write(&path, &bytes)
+        .map_err(|e| format!("Bild schreiben: {e}"))?;
+    Ok(PastedImage {
+        path: path.to_string_lossy().into_owned(),
+        filename,
+        mime_type,
+        size_bytes: bytes.len() as u64,
+    })
+}
+
+/// Map common image MIME types to file extensions. Unknown MIME falls
+/// back to `bin` — better than guessing wrong, since the recipient's
+/// mail client uses the MIME type, not the extension, to decide how to
+/// render it.
+fn ext_for_mime(mime: &str) -> &'static str {
+    match mime.to_ascii_lowercase().as_str() {
+        "image/png" => "png",
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/bmp" => "bmp",
+        "image/svg+xml" => "svg",
+        _ => "bin",
+    }
+}
+
 #[tauri::command]
 pub async fn open_message(
     app: AppHandle,

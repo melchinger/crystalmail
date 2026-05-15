@@ -1054,6 +1054,7 @@ pub async fn tp_send_initial_request(
             path: attachment_path.to_string_lossy().into_owned(),
             filename: Some("envelope-request.json".into()),
             mime_type: Some("application/time-protocol+json".into()),
+            ..Default::default()
         }],
     };
     smtp::send(db, req).await.map_err(|e| format!("smtp: {e}"))?;
@@ -1310,6 +1311,7 @@ async fn send_outbound_envelope(
                 action.as_str().replace('_', "-")
             )),
             mime_type: Some("application/time-protocol+json".into()),
+            ..Default::default()
         }],
     };
     smtp::send(db, req).await.map_err(|e| format!("smtp: {e}"))?;

@@ -28,6 +28,10 @@ pub struct WorkflowId(pub Uuid);
 ///   * `csv` — path to the *first* `.csv` attachment, if present
 ///   * `body_md` — path to a markdown file containing the mail body
 ///     (populated when a `SaveBody` step ran earlier in the chain)
+///   * `body_essentials` — the *content* of the mail body inlined as
+///     a single string, with signature/quoted-reply already stripped
+///     (Markdown-ish; meant to be passed straight into an external
+///     script as a CLI argument — e.g. ticket description)
 ///
 /// In plain string fields (like `SaveAttachments.target_dir`), vars
 /// are referenced as `$name`. In `ScriptParam::Template`, just the

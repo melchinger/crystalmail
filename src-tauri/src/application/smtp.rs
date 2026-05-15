@@ -65,7 +65,7 @@ pub struct SendMailRequest {
     pub attachments: Vec<AttachmentSpec>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Default, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct AttachmentSpec {
     pub path: String,
@@ -77,6 +77,20 @@ pub struct AttachmentSpec {
     /// unless we can guess from the extension.
     #[serde(default)]
     pub mime_type: Option<String>,
+    /// Inline attachment (e.g. a clipboard image pasted into the HTML body).
+    /// When `true`, the part is emitted with `Content-Disposition: inline`
+    /// inside a `multipart/related` sibling of the HTML, and `content_id`
+    /// is the value referenced as `<img src="cid:…">` in the HTML body.
+    /// Recipients with rich-mail clients see the image embedded; the
+    /// attachment is also still listed in the MIME tree, so plain clients
+    /// or "save attachment" flows continue to work.
+    #[serde(default)]
+    pub is_inline: bool,
+    /// CID used for `<img src="cid:…">` references in the HTML body.
+    /// Only meaningful when `is_inline = true`. Required to be unique
+    /// across the message; we trust the frontend to mint UUIDs.
+    #[serde(default)]
+    pub content_id: Option<String>,
 }
 
 /// Hard cap on `to + cc + bcc` total recipients. The number is generous
@@ -753,17 +767,44 @@ fn build_message(account: &AccountSummary, req: &SendMailRequest) -> Result<Mess
         return build_imip_alternative(builder, req, has_html);
     }
 
+    // Partition attachments: inline-with-content-id (referenced as
+    // `<img src="cid:…">` from the HTML body) need to sit inside a
+    // multipart/related sibling of the HTML part, so the recipient's
+    // MUA links the cid: reference to the image data. Everything else
+    // continues to land at multipart/mixed level as a file attachment.
+    let (inline_specs, regular_specs): (Vec<&AttachmentSpec>, Vec<&AttachmentSpec>) =
+        req.attachments.iter().partition(|a| {
+            a.is_inline && a.content_id.is_some() && has_html
+        });
+    let has_regular = !regular_specs.is_empty();
+    let has_inline = !inline_specs.is_empty();
+
     let text_part = SinglePart::builder()
         .header(ContentType::TEXT_PLAIN)
         .body(req.body.clone());
 
+    // Build the "content half" of the message — the user's body proper,
+    // possibly wrapped with inline images via multipart/related.
     let content_part = if has_html {
         let html_part = SinglePart::builder()
             .header(ContentType::TEXT_HTML)
             .body(req.body_html.clone().unwrap_or_default());
-        MultiPart::alternative()
-            .singlepart(text_part)
-            .singlepart(html_part)
+        if has_inline {
+            // multipart/related wraps the HTML + each inline image. The
+            // HTML must be the *first* part so RFC-conforming clients
+            // pick it as the start of the related group.
+            let mut related = MultiPart::related().singlepart(html_part);
+            for spec in &inline_specs {
+                related = related.singlepart(build_inline_part(spec)?);
+            }
+            MultiPart::alternative()
+                .singlepart(text_part)
+                .multipart(related)
+        } else {
+            MultiPart::alternative()
+                .singlepart(text_part)
+                .singlepart(html_part)
+        }
     } else {
         // We still wrap in MultiPart::mixed below if attachments are present;
         // for that we need a MultiPart, so promote to a trivial alternative
@@ -771,41 +812,76 @@ fn build_message(account: &AccountSummary, req: &SendMailRequest) -> Result<Mess
         MultiPart::alternative().singlepart(text_part)
     };
 
-    if !has_attachments {
+    if !has_regular {
         return builder
             .multipart(content_part)
             .map_err(|e| format!("Message bauen: {e}"));
     }
 
     let mut mixed = MultiPart::mixed().multipart(content_part);
-    for spec in &req.attachments {
-        let path = std::path::Path::new(&spec.path);
-        let bytes = std::fs::read(path)
-            .map_err(|e| format!("Datei lesen ({}): {e}", spec.path))?;
-        let filename = spec
-            .filename
-            .clone()
-            .or_else(|| {
-                path.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|s| s.to_string())
-            })
-            .unwrap_or_else(|| "attachment.bin".into());
-        let mime = spec
-            .mime_type
-            .clone()
-            .unwrap_or_else(|| guess_mime(path));
-        let content_type = ContentType::parse(&mime)
-            .map_err(|e| format!("ungültiger MIME-Typ '{mime}': {e}"))?;
-        let body = Body::new(bytes);
-        mixed = mixed.singlepart(
-            Attachment::new(filename).body(body, content_type),
-        );
+    for spec in &regular_specs {
+        mixed = mixed.singlepart(build_regular_attachment_part(spec)?);
     }
 
     builder
         .multipart(mixed)
         .map_err(|e| format!("Message bauen: {e}"))
+}
+
+/// Build a `multipart/related` inline part with a `Content-ID` header
+/// so the HTML body's `<img src="cid:…">` reference resolves. lettre's
+/// `Attachment::new_inline(cid)` produces a SinglePart with
+/// `Content-Disposition: inline; filename=…` and the matching
+/// `Content-ID: <cid>` header — exactly what's needed.
+fn build_inline_part(spec: &AttachmentSpec) -> Result<SinglePart, String> {
+    let path = std::path::Path::new(&spec.path);
+    let bytes = std::fs::read(path)
+        .map_err(|e| format!("Inline-Bild lesen ({}): {e}", spec.path))?;
+    let mime = spec
+        .mime_type
+        .clone()
+        .unwrap_or_else(|| guess_mime(path));
+    let content_type = ContentType::parse(&mime)
+        .map_err(|e| format!("ungültiger MIME-Typ '{mime}': {e}"))?;
+    // `content_id` is guaranteed Some by the caller's partition gate,
+    // but be defensive — clone it out without panicking if the gate
+    // ever changes.
+    let cid = spec
+        .content_id
+        .clone()
+        .ok_or_else(|| "Inline-Attachment ohne content_id".to_string())?;
+    // lettre's `new_inline` sets `Content-Disposition: inline` + the
+    // matching `Content-ID: <cid>` header. Inline parts don't carry a
+    // filename — the HTML `<img>` tag's `alt` text is what surfaces in
+    // a recipient client, not the part filename.
+    Ok(Attachment::new_inline(cid).body(Body::new(bytes), content_type))
+}
+
+/// Existing path for normal file attachments — disposition: attachment,
+/// no Content-ID, no inline embedding. Pulled out into its own helper
+/// so the inline branch can reuse the bytes-read / filename-fallback
+/// logic without duplicating it inline.
+fn build_regular_attachment_part(spec: &AttachmentSpec) -> Result<SinglePart, String> {
+    let path = std::path::Path::new(&spec.path);
+    let bytes = std::fs::read(path)
+        .map_err(|e| format!("Datei lesen ({}): {e}", spec.path))?;
+    let filename = spec
+        .filename
+        .clone()
+        .or_else(|| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "attachment.bin".into());
+    let mime = spec
+        .mime_type
+        .clone()
+        .unwrap_or_else(|| guess_mime(path));
+    let content_type = ContentType::parse(&mime)
+        .map_err(|e| format!("ungültiger MIME-Typ '{mime}': {e}"))?;
+    let body = Body::new(bytes);
+    Ok(Attachment::new(filename).body(body, content_type))
 }
 
 /// True when the attachment looks like an iMIP calendar payload — i.e. the
@@ -887,6 +963,7 @@ mod tests {
             path: "/tmp/x.ics".into(),
             filename: None,
             mime_type: mime.map(|s| s.to_string()),
+            ..Default::default()
         }
     }
 

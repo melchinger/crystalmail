@@ -100,6 +100,16 @@ pub async fn apply(
             }
         }
     }
+    if needs.body_essentials {
+        // Computing this is free relative to the IMAP fetch that's
+        // already happened, so we eager-populate regardless of which
+        // step ends up referencing it. Empty strings are also fine —
+        // a script that's wired to "$body_essentials" should cope with
+        // an empty mail body itself.
+        ctx.body_essentials = Some(
+            super::body_essentials::extract(plain_text.as_deref(), &raw_body),
+        );
+    }
 
     let mut results: Vec<StepResult> = Vec::with_capacity(workflow.steps.len());
     for (idx, step) in workflow.steps.iter().enumerate() {
@@ -144,6 +154,12 @@ struct TemplateCtx {
     /// Populated by a `SaveBody` step — later `RunScript` steps can
     /// then feed `$body_md` to their interpreter.
     body_md: Option<PathBuf>,
+    /// Lazily populated when `$body_essentials` is referenced anywhere
+    /// in the workflow. Holds the cleaned-up message body (signature
+    /// + reply-quote stripped, HTML→text if needed) as a single
+    /// Markdown-ish string — meant to be fed directly into a script as
+    /// a CLI argument (e.g. todo-tool ticket description).
+    body_essentials: Option<String>,
     /// Vom Caller eingesammelte Prompt-Werte. Schlüssel ist der
     /// `ScriptParam.key`, Wert das, was der User im Pre-Apply-Dialog
     /// eingetippt hat. Leer wenn keine Prompt-Params im Workflow oder
@@ -167,6 +183,7 @@ impl TemplateCtx {
             csv: None,
             attachment_files: Vec::new(),
             body_md: None,
+            body_essentials: None,
             prompt_values: std::collections::HashMap::new(),
         }
     }
@@ -282,6 +299,12 @@ impl TemplateCtx {
             "attachments_dir" => self.attachments_dir.as_ref().map(path_to_string),
             "csv" => self.csv.as_ref().map(path_to_string),
             "body_md" => self.body_md.as_ref().map(path_to_string),
+            // Materialised eagerly in `apply()` when any step references
+            // `$body_essentials` — unlike `$body_md` it isn't gated by a
+            // prior `SaveBody` step, since the use case (hand the mail's
+            // relevant content to a ticket-creating script) shouldn't
+            // require the user to wire up an extra step.
+            "body_essentials" => self.body_essentials.clone(),
             _ => None,
         }
     }
@@ -328,6 +351,7 @@ fn sanitize_path_segment(s: &str) -> String {
 #[derive(Default)]
 struct Needs {
     attachments: bool,
+    body_essentials: bool,
 }
 
 fn scan_needs(steps: &[Step]) -> Needs {
@@ -335,6 +359,9 @@ fn scan_needs(steps: &[Step]) -> Needs {
     let mut inspect = |s: &str| {
         if s.contains("$attachments_dir") || s.contains("$csv") {
             n.attachments = true;
+        }
+        if s.contains("$body_essentials") {
+            n.body_essentials = true;
         }
     };
     for step in steps {
@@ -1240,6 +1267,7 @@ mod tests {
             csv: None,
             attachment_files: Vec::new(),
             body_md: None,
+            body_essentials: None,
             prompt_values: std::collections::HashMap::new(),
         }
     }
