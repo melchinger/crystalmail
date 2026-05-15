@@ -22,6 +22,7 @@ import {
   splitAddresses,
   type ComposeSendSnapshot,
 } from "./components/Compose";
+import { rewriteInlineImageSrcs } from "./utils/mailHtml";
 import { CalendarView } from "./components/CalendarView";
 import { ContactsView } from "./components/ContactsView";
 import { ContactDetail } from "./components/ContactDetail";
@@ -878,23 +879,37 @@ export function App() {
    * encoding rules.
    */
   const buildSendRequest = useCallback(
-    (snap: ComposeSendSnapshot) => ({
-      accountId: snap.accountId,
-      from: snap.from ?? undefined,
-      to: splitAddresses(snap.to),
-      cc: splitAddresses(snap.cc),
-      bcc: splitAddresses(snap.bcc),
-      subject: snap.subject,
-      body: snap.body,
-      bodyHtml: snap.bodyHtml,
-      inReplyTo: snap.inReplyToHeader,
-      references: snap.references ?? [],
-      attachments: snap.attachments.map((a) => ({
-        path: a.path,
-        filename: a.filename,
-        mimeType: a.mimeType,
-      })),
-    }),
+    (snap: ComposeSendSnapshot) => {
+      // Rewrite any pasted-image `<img>` tags before they leave the
+      // composer: in the editor they reference a `blob:` URL (alive
+      // only inside this document), but the outgoing HTML must point
+      // at the inline attachment via `cid:<contentId>`. We use the
+      // `data-cid` attribute we stamped at paste-time as the lookup
+      // key — that way we don't have to round-trip blob URLs through
+      // the IPC boundary or reparse the actual image bytes here.
+      const bodyHtml = snap.attachments.some((a) => a.isInline)
+        ? rewriteInlineImageSrcs(snap.bodyHtml)
+        : snap.bodyHtml;
+      return {
+        accountId: snap.accountId,
+        from: snap.from ?? undefined,
+        to: splitAddresses(snap.to),
+        cc: splitAddresses(snap.cc),
+        bcc: splitAddresses(snap.bcc),
+        subject: snap.subject,
+        body: snap.body,
+        bodyHtml,
+        inReplyTo: snap.inReplyToHeader,
+        references: snap.references ?? [],
+        attachments: snap.attachments.map((a) => ({
+          path: a.path,
+          filename: a.filename,
+          mimeType: a.mimeType,
+          isInline: a.isInline ?? false,
+          contentId: a.contentId,
+        })),
+      };
+    },
     [],
   );
 

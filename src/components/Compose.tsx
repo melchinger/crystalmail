@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { AddressAutocomplete } from "./AddressAutocomplete";
 import { RichEditor, type RichEditorHandle } from "./RichEditor";
@@ -265,6 +266,50 @@ export function Compose({
     setAttachments((cur) => cur.filter((a) => a.clientId !== clientId));
   };
 
+  /** Called by RichEditor when the user pastes an image from the clipboard.
+   *  Persists the bytes to a temp file via Tauri, registers an inline
+   *  attachment (so the recipient sees the picture embedded and the
+   *  attachment list still shows it), and returns the CID + a blob: URL
+   *  the editor uses for immediate in-place preview. */
+  const handlePasteImage = async (file: File) => {
+    try {
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      // Pass the byte buffer as plain `Array<number>` — Tauri's IPC
+      // bridge marshals it as a JSON array of integers into `Vec<u8>`
+      // on the Rust side. For images this is fine (typical screenshot
+      // is sub-megabyte); we already cap at 32 MB in the Rust command.
+      const saved = await invoke<{
+        path: string;
+        filename: string;
+        mimeType: string;
+        sizeBytes: number;
+      }>("save_clipboard_image", {
+        bytes: Array.from(bytes),
+        mimeType: file.type || "image/png",
+      });
+      // `@` suffix mirrors RFC 2392 convention so the cid: ref reads as
+      // a proper Message-ID — Outlook used to choke on bare uuids.
+      const contentId = `${crypto.randomUUID().replace(/-/g, "")}@crystalmail`;
+      const previewUrl = URL.createObjectURL(file);
+      setAttachments((cur) => [
+        ...cur,
+        {
+          clientId: crypto.randomUUID(),
+          path: saved.path,
+          filename: saved.filename,
+          sizeBytes: saved.sizeBytes,
+          mimeType: saved.mimeType,
+          isInline: true,
+          contentId,
+        },
+      ]);
+      return { contentId, previewUrl };
+    } catch (e) {
+      setError(String(e));
+      return null;
+    }
+  };
+
   /** Frieren des aktuellen Form-State in einen Snapshot ein. Wird sowohl
    *  vom Send- als auch vom Save-Draft-Pfad benutzt. Body ist sowohl als
    *  raw HTML-fragment (für den Undo-Roundtrip) als auch als wrapped
@@ -517,6 +562,7 @@ export function Compose({
                         : t("compose.bodyPlaceholder")
                   }
                   minHeight={260}
+                  onPasteImage={handlePasteImage}
                 />
               </div>
             </>
@@ -616,6 +662,20 @@ function AttachmentList({
           }}
         >
           <span className="max-w-[16rem] truncate">{a.filename}</span>
+          {a.isInline && (
+            <span
+              className="rounded px-1 text-[9px] uppercase tracking-wide"
+              title={t("attachments.inlineHint", {
+                defaultValue: "Wird im Body eingebettet (cid:)",
+              })}
+              style={{
+                background: "var(--bg-hover)",
+                color: "var(--fg-subtle)",
+              }}
+            >
+              inline
+            </span>
+          )}
           <button
             type="button"
             tabIndex={-1}

@@ -751,6 +751,16 @@ export type ComposeAttachment = {
   filename: string;
   sizeBytes: number;
   mimeType?: string;
+  /** True if this attachment should be embedded inline in the HTML body
+   *  via a `cid:`-reference (e.g. a clipboard image pasted into the
+   *  composer). The list still shows the entry with an "inline" badge so
+   *  the user can see what's attached, but the recipient will see the
+   *  image rendered in-place. */
+  isInline?: boolean;
+  /** CID for the `<img src="cid:…">` reference in the HTML body. Only
+   *  meaningful when `isInline = true`. Generated in the composer when
+   *  the image is pasted, propagates unchanged to the SMTP layer. */
+  contentId?: string;
 };
 
 // ─── Workflows ────────────────────────────────────────────────────────
@@ -1009,6 +1019,10 @@ export const WORKFLOW_TEMPLATE_VARS = [
   "attachments_dir",
   "csv",
   "body_md",
+  // Volltext der Mail (gestripped: Signatur, Quoted-Reply, "Gesendet
+  // von meinem iPhone" raus) — inline als ein einziger String an ein
+  // Skript übergeben (z. B. Ticket-Description fürs Todo-Tool).
+  "body_essentials",
 ] as const;
 
 export type WorkflowTemplateVar = (typeof WORKFLOW_TEMPLATE_VARS)[number];

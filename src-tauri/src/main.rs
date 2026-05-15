@@ -315,6 +315,7 @@ fn main() {
             commands::mail::open_message,
             commands::mail::send_mail,
             commands::mail::save_draft,
+            commands::mail::save_clipboard_image,
             commands::mail::set_message_flags,
             commands::mail::save_attachment,
             commands::mail::open_attachment,

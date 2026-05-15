@@ -949,7 +949,8 @@
         "day": "Tag (lokal), DD",
         "attachments_dir": "Temporärer Ordner mit allen Anhängen",
         "csv": "Pfad zum ersten CSV-Anhang",
-        "body_md": "Pfad zur Body-Markdown-Datei (nur wenn Schritt vorher angelegt)"
+        "body_md": "Pfad zur Body-Markdown-Datei (nur wenn Schritt vorher angelegt)",
+        "body_essentials": "Mail-Inhalt als String (Markdown, ohne Signatur und Quoted-Reply) — direkt als Skript-Argument übergebbar"
       },
       "rulesTitle": "Auto-Filter",
       "rulesAfterSave": "Regeln können angelegt werden, sobald der Workflow einmal gespeichert ist.",

@@ -74,6 +74,40 @@ export function prepareQuoteForEditor(html: string): string {
   return sanitizeFragment(extractHtmlBody(html));
 }
 
+/**
+ * Send-time rewrite: replace the `src=` of every `<img data-cid="X" …>`
+ * in `html` with `src="cid:X"`. Used by the compose path because the
+ * pasted-image flow displays the image via a `blob:` URL in the editor
+ * (so the user sees an immediate preview) but the outgoing MIME has to
+ * reference the inline attachment by its Content-ID instead. The
+ * `data-cid` attribute is then dropped — it's an internal marker, not
+ * something the recipient should see.
+ *
+ * Tolerant of arbitrary attribute order and quote style: works for
+ * `<img data-cid="X" src="blob:…" …>` and `<img src='blob:…' data-cid='X'>`
+ * alike. Images without a `data-cid` are left alone — they're pasted
+ * `<img src="https://…">` references the user typed in by hand.
+ */
+export function rewriteInlineImageSrcs(html: string): string {
+  if (!html.includes("data-cid")) return html;
+  let doc: Document;
+  try {
+    doc = new DOMParser().parseFromString(
+      `<!DOCTYPE html><body>${html}</body>`,
+      "text/html",
+    );
+  } catch {
+    return html;
+  }
+  doc.querySelectorAll("img[data-cid]").forEach((img) => {
+    const cid = img.getAttribute("data-cid");
+    if (!cid) return;
+    img.setAttribute("src", `cid:${cid}`);
+    img.removeAttribute("data-cid");
+  });
+  return doc.body?.innerHTML ?? html;
+}
+
 export function escapeHtml(s: string): string {
   return s
     .replace(/&/g, "&amp;")
