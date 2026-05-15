@@ -519,7 +519,11 @@
     "savingWithProbe": "Speichert + ermittle Server-Verhalten …",
     "testing": "Teste …",
     "testPassed": "Test erfolgreich in {{ms}} ms",
-    "testFailed": "Test fehlgeschlagen nach {{ms}} ms"
+    "testFailed": "Test fehlgeschlagen nach {{ms}} ms",
+    "duplicateTitle": "Konto existiert bereits",
+    "duplicateBody": "Für „{{address}}\" gibt es schon das Konto „{{name}}\". Soll ich die Zugangsdaten und Server-Einstellungen mit den gerade eingegebenen Werten überschreiben?",
+    "duplicateHint": "Bestehende Mails, Ordner-Zuordnungen und gespeicherte Einstellungen bleiben erhalten — nur Passwort und die hier neu eingegebenen Server-Daten werden ersetzt.",
+    "duplicateConfirm": "Zugangsdaten erneuern"
   },
   "common": {
     "loading": "Lädt …",

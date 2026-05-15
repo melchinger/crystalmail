@@ -3,7 +3,7 @@
 // duration of the add call) from what's persisted: the password goes into the
 // OS keyring, the DB stores only a pointer.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -16,6 +16,51 @@ use crate::infrastructure::queries::{self, AccountSummary};
 use crate::state::AppState;
 
 const KEYRING_SERVICE: &str = "crystalmail";
+
+/// Strukturierte Fehler aus `add_account`.
+///
+/// `DuplicateAddress` ist der vom Frontend abfangbare Sonderfall: Ein
+/// Konto mit derselben Adresse existiert schon (typisches Szenario nach
+/// einem macOS-Reinstall, bei dem die SQLCipher-DB überlebt hat aber der
+/// Keychain-ACL-Zugriff verloren ging — der User sieht das alte Konto
+/// nicht mehr funktionieren und versucht es neu anzulegen). Die `existing_id`
+/// gibt dem Frontend den Hebel, daraus einen `update_account`-Aufruf zu
+/// machen statt einer harten DB-Insert-Fehlermeldung.
+///
+/// Alle anderen Fehler (Login fehlgeschlagen, DB schreiben unmöglich,
+/// Keychain weg) gehen in `Other` und werden im Frontend als gewöhnliche
+/// Fehlermeldung angezeigt — Inhalt unverändert wie bisher, nur die Hülle
+/// ist jetzt JSON statt Plain-String.
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AddAccountError {
+    DuplicateAddress {
+        #[serde(rename = "existingId")]
+        existing_id: AccountId,
+        #[serde(rename = "displayName")]
+        display_name: String,
+        address: String,
+    },
+    Other {
+        message: String,
+    },
+}
+
+// `?`-Ergonomie: alle bestehenden `.map_err(|e| format!(...))?`-Ketten
+// liefern `String`, deshalb hier die From-Konvertierung. `&'static str`
+// kommt aus Stellen wie `state.db.get().ok_or("database not ready")?`.
+impl From<String> for AddAccountError {
+    fn from(message: String) -> Self {
+        AddAccountError::Other { message }
+    }
+}
+impl From<&'static str> for AddAccountError {
+    fn from(message: &'static str) -> Self {
+        AddAccountError::Other {
+            message: message.to_string(),
+        }
+    }
+}
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -185,7 +230,43 @@ pub async fn discover_folders(
 }
 
 #[tauri::command]
-pub async fn add_account(app: AppHandle, form: NewAccountForm) -> Result<AccountSummary, String> {
+pub async fn add_account(
+    app: AppHandle,
+    form: NewAccountForm,
+) -> Result<AccountSummary, AddAccountError> {
+    // 0. Duplicate-Address-Check VOR allem anderen.
+    //
+    //    Auf macOS-Reinstalls ist es typisch, dass die SQLCipher-DB überlebt
+    //    (Application Support wird beim Drag-Replace nicht angefasst, der
+    //    `db_master`-Keychain-Eintrag bleibt zugänglich), aber die
+    //    per-Account-Passwörter im Keychain durch ACL-Bindung an die
+    //    Code-Signing-Identity verloren gehen. Das alte `accounts`-Row ist
+    //    dann noch da, nur ohne funktionierendes Passwort. Wenn der User
+    //    versucht, das Konto „neu" anzulegen, würde ohne diese Prüfung der
+    //    `accounts.address UNIQUE`-Constraint zuschlagen und der User säße
+    //    mit einer kryptischen Sqlite-Fehlermeldung fest.
+    //
+    //    Wir geben stattdessen einen strukturierten Fehler zurück; das
+    //    Frontend kann daraus einen Refresh-Credentials-Dialog bauen, der
+    //    intern auf `update_account` mit der existierenden ID umsteigt.
+    {
+        let state = app.state::<AppState>();
+        let db = state.db.get().ok_or("database not ready")?;
+        let conn = db
+            .reads
+            .get()
+            .map_err(|e| format!("db read pool: {e}"))?;
+        if let Some(existing) =
+            queries::find_account_by_address(&conn, &form.address).map_err(|e| e.to_string())?
+        {
+            return Err(AddAccountError::DuplicateAddress {
+                existing_id: existing.id,
+                display_name: existing.display_name,
+                address: existing.address,
+            });
+        }
+    }
+
     // 1. Verify the credentials actually work — unless the caller explicitly
     //    chose to save a draft.
     if !form.skip_test {
