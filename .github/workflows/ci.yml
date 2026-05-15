@@ -15,7 +15,17 @@ jobs:
         with: { node-version: "20" }
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-        with: { workspaces: "src-tauri -> target" }
+        # `cache-bin: false` keeps `~/.cargo/bin` out of the cache. The
+        # default behaviour stashes the rustup-managed `cargo` shim and
+        # restores it on the next run, which on macOS reliably ends with
+        # `rustup-init` (or a stale shim pointing at a removed toolchain)
+        # serving as `cargo`. The first cargo invocation then fails with
+        # `error: unexpected argument 'check' found`. The shim isn't worth
+        # caching anyway — `dtolnay/rust-toolchain` re-installs it fresh
+        # in every run.
+        with:
+          workspaces: "src-tauri -> target"
+          cache-bin: "false"
       - run: npm ci
       - run: npm run build
       - name: Cargo check (src-tauri)
@@ -35,7 +45,17 @@ jobs:
         with: { node-version: "20" }
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-        with: { workspaces: "src-tauri -> target" }
+        # `cache-bin: false` keeps `~/.cargo/bin` out of the cache. The
+        # default behaviour stashes the rustup-managed `cargo` shim and
+        # restores it on the next run, which on macOS reliably ends with
+        # `rustup-init` (or a stale shim pointing at a removed toolchain)
+        # serving as `cargo`. The first cargo invocation then fails with
+        # `error: unexpected argument 'check' found`. The shim isn't worth
+        # caching anyway — `dtolnay/rust-toolchain` re-installs it fresh
+        # in every run.
+        with:
+          workspaces: "src-tauri -> target"
+          cache-bin: "false"
       - name: Install Linux Tauri deps
         if: matrix.os == 'ubuntu-latest'
         run: |

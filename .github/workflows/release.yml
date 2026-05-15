@@ -79,8 +79,13 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        # See ci.yml for the rationale on `cache-bin: false` — keeps the
+        # rustup-managed cargo shim out of the cache so the release build
+        # doesn't trip the same "unexpected argument 'check' found" flake
+        # we hit on macOS post-merge runs.
         with:
           workspaces: "src-tauri -> target"
+          cache-bin: "false"
 
       # Linux-spezifische System-Pakete für Tauri 2.
       # `libwebkit2gtk-4.1-dev`: WebView. Tauri 2 spec; auf 22.04 via
