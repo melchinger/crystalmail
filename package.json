@@ -1,6 +1,6 @@
 {
   "name": "crystalmail",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Clean, fast, local-first IMAP mail client with pi-powered AI features",
   "private": true,
   "type": "module",
