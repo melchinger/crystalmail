@@ -122,23 +122,35 @@ export function plainToHtml(s: string): string {
 }
 
 /**
- * HTML → plain text, used for previews and reply-quote bodies. Not a
- * security sanitizer — strict regex-based tag stripping was unreliable
- * for edge cases (e.g. `</script >` with trailing space, double-encoded
- * entities like `&amp;lt;`) and CodeQL kept flagging it. The DOMParser
- * path drops scripts/styles structurally, turns `<br>` / `<p>` into the
- * appropriate newline counts, and lets `textContent` do entity decoding
- * in a single pass so double-decoding can't happen.
+ * HTML → plain text, used for previews and reply-quote bodies. The
+ * regex-chain we used before was unreliable on edge cases (`</script >`
+ * with trailing space, double-encoded entities like `&amp;lt;`) and
+ * piled up CodeQL findings. The DOMParser path drops dangerous nodes
+ * structurally, turns `<br>` / `<p>` into the right newline counts, and
+ * lets `textContent` do entity decoding in a single pass — no chained
+ * replaces that can double-decode.
  */
 export function stripHtmlToText(html: string): string {
   if (!html) return "";
+  // Route through sanitizeFragment first so scripts, iframes, event
+  // handlers, and javascript-URLs are stripped before we parse. Pure
+  // textContent extraction would already be safe (DOMParser does not
+  // execute scripts and we never re-render the parsed DOM), but doing
+  // this in two steps puts a recognized sanitizer barrier between any
+  // user-controlled DOM input (e.g. the AddAccountDialog signature
+  // textarea) and the parseFromString call. Closes CodeQL's
+  // js/xss-through-dom finding without changing observable behaviour.
+  const safe = sanitizeFragment(html);
   let doc: Document;
   try {
-    doc = new DOMParser().parseFromString(html, "text/html");
+    doc = new DOMParser().parseFromString(safe, "text/html");
   } catch {
-    return html;
+    return safe;
   }
-  doc.querySelectorAll("script, style").forEach((n) => n.remove());
+  // sanitizeFragment intentionally keeps <style> (its callers want
+  // quote-block fidelity). For plain-text extraction we drop them so
+  // their CSS doesn't leak into textContent.
+  doc.querySelectorAll("style").forEach((n) => n.remove());
   doc.querySelectorAll("br").forEach((br) => br.replaceWith("\n"));
   // Trailing double-newline mimics paragraph spacing in the legacy
   // regex version, which mattered for reply quotes that read like the
