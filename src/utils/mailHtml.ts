@@ -121,19 +121,32 @@ export function plainToHtml(s: string): string {
   return escapeHtml(s).replace(/\r?\n/g, "<br>");
 }
 
+/**
+ * HTML → plain text, used for previews and reply-quote bodies. Not a
+ * security sanitizer — strict regex-based tag stripping was unreliable
+ * for edge cases (e.g. `</script >` with trailing space, double-encoded
+ * entities like `&amp;lt;`) and CodeQL kept flagging it. The DOMParser
+ * path drops scripts/styles structurally, turns `<br>` / `<p>` into the
+ * appropriate newline counts, and lets `textContent` do entity decoding
+ * in a single pass so double-decoding can't happen.
+ */
 export function stripHtmlToText(html: string): string {
-  return html
-    .replace(/<style[\s\S]*?<\/style>/gi, "")
-    .replace(/<script[\s\S]*?<\/script>/gi, "")
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<\/p>/gi, "\n\n")
-    .replace(/<[^>]+>/g, "")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
+  if (!html) return "";
+  let doc: Document;
+  try {
+    doc = new DOMParser().parseFromString(html, "text/html");
+  } catch {
+    return html;
+  }
+  doc.querySelectorAll("script, style").forEach((n) => n.remove());
+  doc.querySelectorAll("br").forEach((br) => br.replaceWith("\n"));
+  // Trailing double-newline mimics paragraph spacing in the legacy
+  // regex version, which mattered for reply quotes that read like the
+  // original message's prose layout.
+  doc.querySelectorAll("p").forEach((p) => p.append("\n\n"));
+  const text = doc.body?.textContent ?? "";
+  return text
+    .replace(/\u00a0/g, " ")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
