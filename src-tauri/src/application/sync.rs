@@ -1106,7 +1106,16 @@ async fn drive_uid_fetch(
             let upsert_ok = match tokio::time::timeout(WRITER_ACK_TIMEOUT, rx).await {
                 Ok(Ok(Ok(was_new))) => {
                     stored += 1;
-                    if was_new && count_for_chime {
+                    // Spam-Rule-Treffer zählen NICHT als "neue Mail" für die
+                    // Chime-/Refresh-Pipeline: der nachgelagerte Auto-Move
+                    // verschiebt sie sowieso aus der Inbox, also würden
+                    // Audiosignal und Inbox-Refresh nur kurz für einen
+                    // Eintrag triggern, der sofort wieder verschwindet —
+                    // genau die "Spam-Ping"-UX, die der Filter verhindern
+                    // soll. Mit dem !matched_rule-Gate bleibt newInInbox=0,
+                    // wenn nur Filter-Treffer reinkamen → kein Ton, kein
+                    // Refresh, kein Aufblitzen in der Liste.
+                    if was_new && count_for_chime && !matched_rule {
                         new_in_inbox += 1;
                     }
                     true
