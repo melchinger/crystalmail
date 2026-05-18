@@ -5,6 +5,14 @@ on:
     branches: ["main"]
   pull_request:
 
+# Least-privilege token: CI only needs to read the repo to build and
+# typecheck. No issue/PR comments, no release uploads, no package
+# publishing. Closes the CodeQL `actions/missing-workflow-permissions`
+# warning — and limits blast radius if a third-party action is ever
+# compromised.
+permissions:
+  contents: read
+
 jobs:
   build-windows:
     name: Build (Windows)
