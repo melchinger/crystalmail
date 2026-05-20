@@ -121,19 +121,44 @@ export function plainToHtml(s: string): string {
   return escapeHtml(s).replace(/\r?\n/g, "<br>");
 }
 
+/**
+ * HTML → plain text, used for previews and reply-quote bodies. The
+ * regex-chain we used before was unreliable on edge cases (`</script >`
+ * with trailing space, double-encoded entities like `&amp;lt;`) and
+ * piled up CodeQL findings. The DOMParser path drops dangerous nodes
+ * structurally, turns `<br>` / `<p>` into the right newline counts, and
+ * lets `textContent` do entity decoding in a single pass — no chained
+ * replaces that can double-decode.
+ */
 export function stripHtmlToText(html: string): string {
-  return html
-    .replace(/<style[\s\S]*?<\/style>/gi, "")
-    .replace(/<script[\s\S]*?<\/script>/gi, "")
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<\/p>/gi, "\n\n")
-    .replace(/<[^>]+>/g, "")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
+  if (!html) return "";
+  // Route through sanitizeFragment first so scripts, iframes, event
+  // handlers, and javascript-URLs are stripped before we parse. Pure
+  // textContent extraction would already be safe (DOMParser does not
+  // execute scripts and we never re-render the parsed DOM), but doing
+  // this in two steps puts a recognized sanitizer barrier between any
+  // user-controlled DOM input (e.g. the AddAccountDialog signature
+  // textarea) and the parseFromString call. Closes CodeQL's
+  // js/xss-through-dom finding without changing observable behaviour.
+  const safe = sanitizeFragment(html);
+  let doc: Document;
+  try {
+    doc = new DOMParser().parseFromString(safe, "text/html");
+  } catch {
+    return safe;
+  }
+  // sanitizeFragment intentionally keeps <style> (its callers want
+  // quote-block fidelity). For plain-text extraction we drop them so
+  // their CSS doesn't leak into textContent.
+  doc.querySelectorAll("style").forEach((n) => n.remove());
+  doc.querySelectorAll("br").forEach((br) => br.replaceWith("\n"));
+  // Trailing double-newline mimics paragraph spacing in the legacy
+  // regex version, which mattered for reply quotes that read like the
+  // original message's prose layout.
+  doc.querySelectorAll("p").forEach((p) => p.append("\n\n"));
+  const text = doc.body?.textContent ?? "";
+  return text
+    .replace(/\u00a0/g, " ")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 }

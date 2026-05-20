@@ -45,9 +45,13 @@ function formatAddress(c: AddressCompletion): string {
   const localPart = c.email.split("@")[0]?.toLowerCase() ?? "";
   if (name.trim().toLowerCase() === localPart) return c.email;
   // Anführungszeichen wenn der Name Sonderzeichen hat — minimaler
-  // RFC-2822-Korrektheit-Aufwand.
+  // RFC-2822-Korrektheit-Aufwand. Backslash MUSS vor dem Anführungs-
+  // zeichen escaped werden, sonst macht der zweite Replace aus einem
+  // bereits-escapten `\"` ein doppelt-escaptes `\\"` und der Quoted-
+  // String beim Empfänger ist kaputt.
   const needsQuote = /[",;<>@]/.test(name);
-  const safe = needsQuote ? `"${name.replace(/"/g, '\\"')}"` : name;
+  const escaped = name.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  const safe = needsQuote ? `"${escaped}"` : name;
   return `${safe} <${c.email}>`;
 }
 
