@@ -87,6 +87,38 @@ export function isAllDayEvent(ev: Commitment): boolean {
 }
 
 /**
+ * Convert an HTML5 `datetime-local`-shaped string (timezone-naïve,
+ * `YYYY-MM-DDTHH:MM` or `YYYY-MM-DDTHH:MM:SS`) into an RFC 3339
+ * timestamp with the system's local offset applied. The naive input is
+ * interpreted as wall-clock time in the user's TZ.
+ *
+ * Used by:
+ *   - EventEditor: form input → backend round-trip
+ *   - Reader: pi-extracted naïve event-times → backend-shaped startAt
+ */
+export function localDateTimeToRfc3339(local: string): string {
+  const d = new Date(local);
+  const Y = d.getFullYear();
+  const M = pad2(d.getMonth() + 1);
+  const D = pad2(d.getDate());
+  const h = pad2(d.getHours());
+  const m = pad2(d.getMinutes());
+  const s = pad2(d.getSeconds());
+  // JS getTimezoneOffset returns minutes WEST of UTC (positive for negative
+  // offsets), so flip the sign.
+  const offMin = -d.getTimezoneOffset();
+  const sign = offMin >= 0 ? "+" : "-";
+  const absMin = Math.abs(offMin);
+  const oh = pad2(Math.floor(absMin / 60));
+  const om = pad2(absMin % 60);
+  return `${Y}-${M}-${D}T${h}:${m}:${s}${sign}${oh}:${om}`;
+}
+
+function pad2(n: number): string {
+  return String(n).padStart(2, "0");
+}
+
+/**
  * How many local days an all-day event covers. Returns `1` for a single
  * day, `7` for a full week, etc. Uses ceil(duration/24h) so a 23:59:59-
  * end-time-style event still reports the right span.

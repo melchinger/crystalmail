@@ -285,6 +285,82 @@ pub async fn cal_list_in_range(
     Ok(rows)
 }
 
+/// Extract event details from a stored mail via pi. Does NOT persist —
+/// returns a draft for the frontend to open in the EventEditor (the
+/// user reviews and saves). `Empty` outcome means pi found no usable
+/// event data; the UI surfaces that as a polite "nichts gefunden"
+/// banner instead of an error.
+#[tauri::command]
+pub async fn cal_extract_from_message(
+    app: AppHandle,
+    message_id: MessageId,
+) -> Result<crate::application::event_extract::EventExtractionResult, String> {
+    let state = app.state::<AppState>();
+    let db = state.db.get().ok_or("database not ready")?;
+    crate::application::event_extract::extract_event_for_message(
+        app.clone(),
+        db.clone(),
+        message_id,
+    )
+    .await
+}
+
+/// List commitments touching a contact (matched by any of the contact's
+/// email addresses against ORGANIZER or any ATTENDEE row). The contact's
+/// emails are resolved on the backend so the frontend doesn't need to
+/// pass them in — same shape as `commands::contacts::list_messages_for_contact`.
+///
+/// `from`/`to` bound the `start_at` of returned events (RFC 3339). The
+/// caller typically passes `now - 30d` and a far-future upper bound,
+/// then partitions the result into "Anstehend" vs "Letzte 30 Tage" in
+/// the UI. CANCELLED rows are excluded. Subscription overlays are not
+/// included — those events live outside SQLite and the contact-side
+/// view focuses on commitments the user actually accepted/organized.
+#[tauri::command]
+pub async fn cal_list_for_contact(
+    app: AppHandle,
+    contact_id: String,
+    from: String,
+    to: String,
+    limit: Option<i64>,
+) -> Result<Vec<Commitment>, String> {
+    let state = app.state::<AppState>();
+    let db = state.db.get().ok_or("database not ready")?;
+    let contact_uuid =
+        uuid::Uuid::parse_str(&contact_id).map_err(|e| format!("invalid contact_id: {e}"))?;
+    let lim = limit.unwrap_or(200).clamp(1, 1000);
+
+    tauri::async_runtime::spawn_blocking({
+        let db = db.clone();
+        move || -> Result<Vec<Commitment>, String> {
+            let conn = db.reads.get().map_err(|e| e.to_string())?;
+            // Resolve the contact's email addresses. The contacts schema
+            // owns this table; the calendar store reads it through plain
+            // SQL rather than crossing module boundaries — Calendar's
+            // Mail-layer-boundary discipline doesn't apply to its own
+            // SQLite (the DB is shared infrastructure, not Mail-domain).
+            let mut stmt = conn
+                .prepare("SELECT email FROM contact_emails WHERE contact_id = ?1")
+                .map_err(|e| format!("prepare contact_emails: {e}"))?;
+            let emails: Vec<String> = stmt
+                .query_map(
+                    rusqlite::params![contact_uuid.to_string()],
+                    |r| r.get::<_, String>(0),
+                )
+                .map_err(|e| format!("query contact_emails: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("collect contact_emails: {e}"))?;
+            if emails.is_empty() {
+                return Ok(Vec::new());
+            }
+            store::list_for_emails(&conn, &emails, &from, &to, lim)
+                .map_err(|e| e.to_string())
+        }
+    })
+    .await
+    .map_err(|e| format!("cal_list_for_contact panicked: {e}"))?
+}
+
 /// Fetch a single commitment with its attendees attached.
 #[tauri::command]
 pub async fn cal_get(
@@ -732,6 +808,367 @@ pub async fn cal_export_to_ics(
     })
     .await
     .map_err(|e| format!("cal_export task panicked: {e}"))?
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InvitationRequestDraft {
+    /// Persisted commitment after SEQUENCE bump + organizer stamp. Mirrors
+    /// the contract of `cal_update` — frontend uses it to refresh its
+    /// in-memory copy without a second round-trip.
+    pub commitment: Commitment,
+    /// Each attendee in a To: shape ready to drop into a ComposeDraft.
+    /// `email` is the bare address; `display_name` is the optional CN.
+    /// The frontend formats `"Name <email>, …"` itself so the user can
+    /// edit before sending.
+    pub recipients: Vec<IcsParticipant>,
+    /// Echoed for the subject/body templating in the frontend.
+    pub event_summary: Option<String>,
+    /// On-disk path of the freshly-written REQUEST ICS. Drop into the
+    /// outgoing ComposeDraft attachments — the SMTP path's iMIP detection
+    /// (`method=REQUEST`) routes it as `multipart/alternative`.
+    pub attachment_path: String,
+    pub attachment_filename: String,
+    pub attachment_size_bytes: u32,
+}
+
+/// Stamp the sending account as ORGANIZER, bump SEQUENCE by 1 (RFC 5546
+/// §3.2.2.1: every REQUEST that is not the initial advertisement must
+/// carry a higher SEQUENCE than the previous one — we treat every
+/// explicit "send invitation" click as a re-advertisement so re-invites
+/// after edits stay spec-conformant), persist the updated row, render a
+/// METHOD:REQUEST ICS, drop it in a stable temp file, and hand the
+/// frontend everything it needs to seed a Compose draft.
+///
+/// Refuses commitments without attendees (no one to invite), commitments
+/// from third-party subscriptions (we don't own the canonical row), and
+/// `CANCELLED` rows (cancellation re-publish goes through a separate
+/// CANCEL flow — not in this PR).
+#[tauri::command]
+pub async fn cal_build_invitation_request(
+    app: AppHandle,
+    id: String,
+    account_id: AccountId,
+) -> Result<InvitationRequestDraft, String> {
+    let state = app.state::<AppState>();
+    let db = state.db.get().ok_or("database not ready")?;
+
+    // Resolve the sending account up front so we can fail fast before any
+    // mutation. We need both address (mandatory ORGANIZER mailto) and
+    // from_name (optional CN).
+    let (organizer_email, organizer_name) = {
+        let db_for_read = db.clone();
+        let account_id = account_id.clone();
+        tauri::async_runtime::spawn_blocking(move || -> Result<(String, String), String> {
+            let conn = db_for_read.reads.get().map_err(|e| e.to_string())?;
+            let acc = queries::get_account(&conn, &account_id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "account not found".to_string())?;
+            Ok((acc.address, acc.from_name))
+        })
+        .await
+        .map_err(|e| format!("account lookup panicked: {e}"))??
+    };
+
+    let existing = {
+        let db_for_read = db.clone();
+        let id_for_read = id.clone();
+        tauri::async_runtime::spawn_blocking(move || -> Result<Commitment, String> {
+            let conn = db_for_read.reads.get().map_err(|e| e.to_string())?;
+            store::get_with_attendees(&conn, &id_for_read)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "commitment not found".to_string())
+        })
+        .await
+        .map_err(|e| format!("cal_build_invitation read panicked: {e}"))??
+    };
+
+    if existing.subscription_id.is_some() {
+        return Err("cannot invite from a subscribed (read-only) event".into());
+    }
+    if existing.status == CommitmentStatus::Cancelled {
+        return Err("cannot send invitation for a cancelled event".into());
+    }
+    if existing.attendees.is_empty() {
+        return Err("no attendees to invite".into());
+    }
+
+    // Strip the organizer from the attendee list — RFC 5546 §3.2.2.1
+    // forbids the ORGANIZER also appearing as ATTENDEE. UI lets the user
+    // accidentally type their own address, so we self-heal here.
+    let attendees_for_send: Vec<CommitmentAttendee> = existing
+        .attendees
+        .iter()
+        .filter(|a| !a.email.eq_ignore_ascii_case(&organizer_email))
+        .cloned()
+        .collect();
+    if attendees_for_send.is_empty() {
+        return Err("no attendees to invite (only the organizer is listed)".into());
+    }
+
+    let organizer = IcsParticipant {
+        email: organizer_email.clone(),
+        display_name: if organizer_name.trim().is_empty() {
+            None
+        } else {
+            Some(organizer_name.clone())
+        },
+        partstat: None,
+    };
+
+    let now = chrono::Utc::now();
+    let updated = Commitment {
+        id: existing.id.clone(),
+        uid: existing.uid.clone(),
+        sequence: existing.sequence + 1,
+        summary: existing.summary.clone(),
+        description: existing.description.clone(),
+        location: existing.location.clone(),
+        start_at: existing.start_at.clone(),
+        end_at: existing.end_at.clone(),
+        original_tzid: existing.original_tzid.clone(),
+        organizer: Some(organizer.clone()),
+        // Persisted attendees keep their stored state (including the
+        // organizer-if-self-added) — it's only the *outgoing* ICS that
+        // drops the organizer. Stripping persisted state would discard
+        // any PARTSTAT already recorded for a prior reply.
+        attendees: existing.attendees.clone(),
+        source: existing.source,
+        status: existing.status,
+        last_published_sequence: existing.last_published_sequence,
+        source_message_id: existing.source_message_id.clone(),
+        series_uid: existing.series_uid.clone(),
+        subscription_id: None,
+        created_at: existing.created_at,
+        updated_at: now,
+    };
+
+    // Build the REQUEST ICS off a synthetic Commitment whose `attendees`
+    // is the deduplicated send-list. This keeps the ICS attendee block
+    // free of the organizer without diverging the stored row.
+    let mut for_ics = updated.clone();
+    for_ics.attendees = attendees_for_send.clone();
+    let ics_text = ics::build_invitation_request(&for_ics);
+
+    // Persist after building (so a builder panic doesn't leave a half-
+    // bumped row behind). Writer is atomic.
+    let (tx, rx) = oneshot::channel();
+    db.writer
+        .send(WriteCmd::UpsertCommitment {
+            commitment: updated.clone(),
+            ack: tx,
+        })
+        .await
+        .map_err(|_| "writer channel closed")?;
+    rx.await
+        .map_err(|_| "writer dropped ack".to_string())?
+        .map_err(|e| format!("db update: {e}"))?;
+
+    // Write the ICS to a stable temp location, scoped per commitment.
+    // Re-clicking "Einladung senden" overwrites idempotently — only one
+    // outstanding invite per event at a time.
+    let dir = std::env::temp_dir()
+        .join("crystalmail")
+        .join("ics-request")
+        .join(&updated.id);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create request temp dir: {e}"))?;
+    let filename = format!(
+        "invite-{}.ics",
+        ics_filename_from_summary(updated.summary.as_deref(), &updated.id)
+            .trim_end_matches(".ics")
+    );
+    let path = dir.join(&filename);
+    let bytes = ics_text.into_bytes();
+    let size = bytes.len() as u32;
+    std::fs::write(&path, &bytes).map_err(|e| format!("write request ics: {e}"))?;
+
+    maybe_spawn_mutation_sync(&app, "cal_build_invitation_request");
+
+    Ok(InvitationRequestDraft {
+        commitment: updated.clone(),
+        recipients: attendees_for_send
+            .iter()
+            .map(|a| IcsParticipant {
+                email: a.email.clone(),
+                display_name: a.display_name.clone(),
+                partstat: a.partstat.clone(),
+            })
+            .collect(),
+        event_summary: updated.summary,
+        attachment_path: path.to_string_lossy().into_owned(),
+        attachment_filename: filename,
+        attachment_size_bytes: size,
+    })
+}
+
+/// Outcome the frontend banner uses to decide between
+/// "Bob hat zugesagt" / "Bob hat abgesagt" / "kein passender Termin".
+/// Mirrors `ics::ReplyApplyOutcome` plus the extra context the UI needs
+/// (responder identity + the row that was updated).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InvitationReplyApplied {
+    /// UID echoed from the REPLY — useful for the UI's "view this event"
+    /// deep-link even when no local row exists yet.
+    pub uid: String,
+    /// `applied` / `noMatchingCommitment` / `noMatchingAttendee`.
+    pub outcome: super::ics::ReplyApplyOutcome,
+    /// PARTSTAT we actually wrote (`ACCEPTED`, `DECLINED`, `TENTATIVE`,
+    /// …). `None` when nothing was applied. Single value — REPLYs
+    /// typically carry one ATTENDEE; if multiple, we report the first
+    /// matched one.
+    pub responder_partstat: Option<String>,
+    /// The responder's mailto address from the REPLY's ATTENDEE line —
+    /// surfaced so the banner can say "Bob hat zugesagt" without re-
+    /// reading the parsed event. `None` when the REPLY had no usable
+    /// ATTENDEE entries.
+    pub responder_email: Option<String>,
+    pub responder_display_name: Option<String>,
+    /// Updated row when `outcome = Applied`; `None` otherwise.
+    pub commitment: Option<Commitment>,
+}
+
+/// Apply an inbound `text/calendar; method=REPLY` attachment to the local
+/// commitment it references. Idempotent — re-applying the same REPLY
+/// writes the same PARTSTAT a second time, no row churn beyond
+/// `updated_at`. Silent on UID-not-found (we likely organized the invite
+/// on a different device) and on attendee-not-found (delegation or typo).
+///
+/// Does NOT bump SEQUENCE: RFC 5546 §3.2.3 treats REPLYs as
+/// attendee-scoped responses to a specific SEQUENCE the organizer
+/// already advertised, not a new revision of the event.
+#[tauri::command]
+pub async fn cal_apply_invitation_reply(
+    app: AppHandle,
+    message_id: MessageId,
+    part_idx: u32,
+) -> Result<InvitationReplyApplied, String> {
+    let state = app.state::<AppState>();
+    let db = state.db.get().ok_or("database not ready")?;
+
+    // Parse the ICS off the writer thread (file I/O + parser).
+    let parsed = {
+        let db_for_parse = db.clone();
+        let message_id = message_id.clone();
+        tauri::async_runtime::spawn_blocking(move || -> Result<ParsedIcsEvent, String> {
+            let (bytes, _filename, _mime) = attachments::bytes(
+                &db_for_parse,
+                &message_id,
+                part_idx,
+            )?;
+            ics::parse(&bytes)?
+                .ok_or_else(|| "ICS attachment contains no event".to_string())
+        })
+        .await
+        .map_err(|e| format!("ics parse panicked: {e}"))??
+    };
+
+    // Refuse non-REPLY: the dedicated REQUEST/REPLY paths must stay
+    // separate so we never mistake an Outlook calendar-publish for a
+    // response.
+    let is_reply = parsed
+        .method
+        .as_deref()
+        .map(|m| m.eq_ignore_ascii_case("REPLY"))
+        .unwrap_or(false);
+    if !is_reply {
+        return Err(format!(
+            "expected METHOD:REPLY, got {:?}",
+            parsed.method
+        ));
+    }
+
+    // Find the responder we'll report on (first ATTENDEE with a
+    // non-empty PARTSTAT). The apply loop below handles all of them,
+    // but the UI banner only needs one summary line.
+    let responder = parsed
+        .attendees
+        .iter()
+        .find(|a| {
+            a.partstat
+                .as_deref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
+        })
+        .cloned();
+
+    // Look up the local commitment by UID.
+    let existing = {
+        let db_for_read = db.clone();
+        let uid = parsed.uid.clone();
+        tauri::async_runtime::spawn_blocking(
+            move || -> Result<Option<Commitment>, String> {
+                let conn = db_for_read.reads.get().map_err(|e| e.to_string())?;
+                store::get_by_uid(&conn, &uid).map_err(|e| e.to_string())
+            },
+        )
+        .await
+        .map_err(|e| format!("cal_apply_reply read panicked: {e}"))??
+    };
+
+    let Some(existing) = existing else {
+        return Ok(InvitationReplyApplied {
+            uid: parsed.uid,
+            outcome: super::ics::ReplyApplyOutcome::NoMatchingCommitment,
+            responder_partstat: responder.as_ref().and_then(|r| r.partstat.clone()),
+            responder_email: responder.as_ref().map(|r| r.email.clone()),
+            responder_display_name: responder.as_ref().and_then(|r| r.display_name.clone()),
+            commitment: None,
+        });
+    };
+
+    // Subscriptions are read-only overlays — they never live in
+    // SQLite, so `get_by_uid` shouldn't return one. Belt-and-braces.
+    if existing.subscription_id.is_some() {
+        return Ok(InvitationReplyApplied {
+            uid: parsed.uid,
+            outcome: super::ics::ReplyApplyOutcome::NoMatchingCommitment,
+            responder_partstat: responder.as_ref().and_then(|r| r.partstat.clone()),
+            responder_email: responder.as_ref().map(|r| r.email.clone()),
+            responder_display_name: responder.as_ref().and_then(|r| r.display_name.clone()),
+            commitment: None,
+        });
+    }
+
+    let (updated, outcome) = ics::apply_reply_to_commitment(&existing, &parsed);
+
+    if outcome != super::ics::ReplyApplyOutcome::Applied {
+        return Ok(InvitationReplyApplied {
+            uid: parsed.uid,
+            outcome,
+            responder_partstat: responder.as_ref().and_then(|r| r.partstat.clone()),
+            responder_email: responder.as_ref().map(|r| r.email.clone()),
+            responder_display_name: responder.as_ref().and_then(|r| r.display_name.clone()),
+            commitment: None,
+        });
+    }
+
+    // Persist. PARTSTAT updates are not a SEQUENCE-bump (see §3.2.3 of
+    // RFC 5546) — `maybe_spawn_mutation_sync` still fires because the
+    // attendee row mutated, and the IMAP-folder profile expects local
+    // mutations to round-trip back as PUBLISH envelopes. But the
+    // VEVENT SEQUENCE stays put.
+    let (tx, rx) = oneshot::channel();
+    db.writer
+        .send(WriteCmd::UpsertCommitment {
+            commitment: updated.clone(),
+            ack: tx,
+        })
+        .await
+        .map_err(|_| "writer channel closed")?;
+    rx.await
+        .map_err(|_| "writer dropped ack".to_string())?
+        .map_err(|e| format!("db apply reply: {e}"))?;
+    maybe_spawn_mutation_sync(&app, "cal_apply_invitation_reply");
+
+    Ok(InvitationReplyApplied {
+        uid: parsed.uid,
+        outcome,
+        responder_partstat: responder.as_ref().and_then(|r| r.partstat.clone()),
+        responder_email: responder.as_ref().map(|r| r.email.clone()),
+        responder_display_name: responder.as_ref().and_then(|r| r.display_name.clone()),
+        commitment: Some(updated),
+    })
 }
 
 fn ics_filename_from_summary(summary: Option<&str>, id: &str) -> String {
@@ -1419,6 +1856,7 @@ async fn materialize_commitment_if_confirmed(
         organizer: Some(IcsParticipant {
             email: organizer_email.clone(),
             display_name: None,
+            partstat: None,
         }),
         attendees: vec![
             CommitmentAttendee {

@@ -14,6 +14,13 @@ use serde::{Deserialize, Serialize};
 pub struct IcsParticipant {
     pub email: String,
     pub display_name: Option<String>,
+    /// RFC 5545 PARTSTAT parameter when present on the ATTENDEE line
+    /// (`ACCEPTED`, `DECLINED`, `TENTATIVE`, `NEEDS-ACTION`, …). Always
+    /// `None` for ORGANIZER lines and for REQUEST imports that pre-date
+    /// this field. Used by the inbound REPLY path to read the responder's
+    /// status without re-parsing the raw VEVENT.
+    #[serde(default)]
+    pub partstat: Option<String>,
 }
 
 /// Single parsed VEVENT, sufficient to render an invitation banner and to

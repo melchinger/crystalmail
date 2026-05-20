@@ -19,6 +19,7 @@ use std::io::Cursor;
 use chrono::{FixedOffset, Local, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use ical::parser::ical::component::IcalEvent;
 use ical::IcalParser;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::domain::{
@@ -140,18 +141,30 @@ fn participant_from_property(prop: &ical::property::Property) -> IcsParticipant 
         .map(strip_mailto)
         .unwrap_or_default()
         .to_string();
-    let display_name = prop.params.as_ref().and_then(|params| {
-        params.iter().find_map(|(key, vals)| {
+    let mut display_name: Option<String> = None;
+    let mut partstat: Option<String> = None;
+    if let Some(params) = prop.params.as_ref() {
+        for (key, vals) in params.iter() {
             if key.eq_ignore_ascii_case("CN") {
-                vals.first().cloned()
-            } else {
-                None
+                if display_name.is_none() {
+                    display_name = vals.first().cloned();
+                }
+            } else if key.eq_ignore_ascii_case("PARTSTAT") {
+                if partstat.is_none() {
+                    // Normalize to uppercase — RFC 5545 §3.2.12 lists the
+                    // values as uppercase tokens and most senders comply,
+                    // but Outlook has shipped lowercase variants in the
+                    // past. Up-casing here keeps downstream comparisons
+                    // case-stable.
+                    partstat = vals.first().map(|s| s.to_ascii_uppercase());
+                }
             }
-        })
-    });
+        }
+    }
     IcsParticipant {
         email,
         display_name,
+        partstat,
     }
 }
 
@@ -670,6 +683,167 @@ fn commitment_attendee_line(a: &CommitmentAttendee) -> String {
     }
 }
 
+/// REQUEST-flavored attendee line. Differs from `commitment_attendee_line`
+/// in two ways: ROLE=REQ-PARTICIPANT is stamped explicitly (some receivers
+/// trip on its absence even though it's the spec default), and RSVP=TRUE
+/// is added so calendar clients render the Accept/Decline buttons. The
+/// PARTSTAT we send out is always NEEDS-ACTION — we know nothing about the
+/// recipient's calendar state at send time, and re-using a stored
+/// PARTSTAT (typically only set for ourselves on imported invites) would
+/// be misleading.
+fn request_attendee_line(a: &CommitmentAttendee) -> String {
+    let cn = a.display_name.as_deref().filter(|s| !s.is_empty());
+    match cn {
+        Some(name) => format!(
+            "ATTENDEE;CN={};ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:{}",
+            escape_param(name),
+            a.email,
+        ),
+        None => format!(
+            "ATTENDEE;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:{}",
+            a.email,
+        ),
+    }
+}
+
+/// Build an RFC 5546 REQUEST iCalendar for an organizer-side invitation.
+/// The output is a full VCALENDAR with `METHOD:REQUEST`, intended to be
+/// dropped into an outgoing iMIP mail (the SMTP layer detects the
+/// `method=REQUEST` Content-Type parameter and routes it as a
+/// multipart/alternative body part, matching Outlook/Google/Zoho's
+/// auto-process expectations).
+///
+/// The caller is expected to ensure `c.organizer` is set — REQUESTs
+/// without an ORGANIZER are non-conformant (RFC 5546 §3.2.2) and most
+/// receivers will reject them. The frontend stamps the sending account's
+/// address into the commitment before calling this.
+pub fn build_invitation_request(c: &Commitment) -> String {
+    let mut out = String::new();
+    push_line(&mut out, "BEGIN:VCALENDAR");
+    push_line(&mut out, "VERSION:2.0");
+    push_line(&mut out, &format!("PRODID:{PRODID}"));
+    push_line(&mut out, "METHOD:REQUEST");
+    push_line(&mut out, "BEGIN:VEVENT");
+
+    push_folded(&mut out, &format!("UID:{}", escape_text(&c.uid)));
+    push_line(&mut out, &format!("SEQUENCE:{}", c.sequence));
+    push_line(
+        &mut out,
+        &format!("DTSTAMP:{}", Utc::now().format("%Y%m%dT%H%M%SZ")),
+    );
+
+    push_folded(&mut out, &format!("DTSTART:{}", rfc3339_to_ics(&c.start_at)));
+    push_folded(&mut out, &format!("DTEND:{}", rfc3339_to_ics(&c.end_at)));
+
+    if let Some(s) = &c.summary {
+        push_folded(&mut out, &format!("SUMMARY:{}", escape_text(s)));
+    }
+    if let Some(d) = &c.description {
+        push_folded(&mut out, &format!("DESCRIPTION:{}", escape_text(d)));
+    }
+    if let Some(l) = &c.location {
+        push_folded(&mut out, &format!("LOCATION:{}", escape_text(l)));
+    }
+    if let Some(org) = &c.organizer {
+        push_folded(&mut out, &organizer_line(org));
+    }
+    for a in &c.attendees {
+        push_folded(&mut out, &request_attendee_line(a));
+    }
+    push_line(&mut out, &format!("STATUS:{}", c.status.as_str()));
+
+    push_line(&mut out, "END:VEVENT");
+    push_line(&mut out, "END:VCALENDAR");
+    out
+}
+
+// ─── Phase 1.5: inbound REPLY handling ───────────────────────────────────
+//
+// When an invited person clicks Accept/Decline in their MUA, their client
+// emits an RFC 5546 REPLY VCALENDAR (METHOD=REPLY, the original UID, the
+// responder's ATTENDEE line carrying their PARTSTAT). This block applies
+// that to the local commitment we organized — finding the row by UID,
+// matching the responder by email, and stamping PARTSTAT in place. The
+// row's SEQUENCE is *not* bumped: per RFC 5546 §3.2.3 the responder
+// references the same SEQUENCE the REQUEST had; PARTSTAT updates are
+// attendee-scoped state, not event-scoped revisions.
+
+/// Result of applying an inbound REPLY. None of these are errors — they
+/// are status codes the UI uses to decide what banner to show.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ReplyApplyOutcome {
+    /// Found the local commitment and updated at least one attendee.
+    Applied,
+    /// No local commitment for this UID — we never sent this invite
+    /// from this device, or the user already cancelled it. Silent skip.
+    NoMatchingCommitment,
+    /// Found the commitment but none of the REPLY's ATTENDEE entries
+    /// match an attendee on our row. Could be a delegation REPLY from
+    /// someone we didn't invite (`DELEGATED-FROM` would be set, but we
+    /// don't honor delegations in Phase 1.5), or a typo'd address.
+    NoMatchingAttendee,
+}
+
+/// Apply a parsed REPLY ICS to a stored commitment, returning the updated
+/// commitment (or the original unchanged when nothing matched).
+///
+/// Match rule: case-insensitive email equality between each REPLY
+/// ATTENDEE and our stored attendees. The responder's `displayName` is
+/// adopted only when our row lacked one — we don't second-guess CN we
+/// already have. PARTSTAT is overwritten unconditionally.
+///
+/// The caller is responsible for the UID match (this function trusts
+/// `reply.uid` matches `c.uid`); see `cal_apply_invitation_reply` for
+/// the orchestration.
+pub fn apply_reply_to_commitment(
+    c: &Commitment,
+    reply: &ParsedIcsEvent,
+) -> (Commitment, ReplyApplyOutcome) {
+    let mut updated = c.clone();
+    let mut matched_any = false;
+
+    for replying in &reply.attendees {
+        let Some(partstat) = replying
+            .partstat
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            // REPLY without PARTSTAT is malformed per RFC 5546 — skip
+            // rather than write `NEEDS-ACTION` (which would falsely
+            // imply we received a real response).
+            continue;
+        };
+        for attendee in updated.attendees.iter_mut() {
+            if attendee.email.eq_ignore_ascii_case(&replying.email) {
+                attendee.partstat = Some(partstat.to_ascii_uppercase());
+                // Backfill display_name from the REPLY only if we don't
+                // already know one. Don't clobber an organizer-side CN
+                // the user might have curated.
+                if attendee.display_name.is_none() {
+                    if let Some(dn) = replying
+                        .display_name
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        attendee.display_name = Some(dn.to_string());
+                    }
+                }
+                matched_any = true;
+            }
+        }
+    }
+
+    if matched_any {
+        updated.updated_at = Utc::now();
+        (updated, ReplyApplyOutcome::Applied)
+    } else {
+        (updated, ReplyApplyOutcome::NoMatchingAttendee)
+    }
+}
+
 /// Parse one of the four ICS time shapes into an RFC 3339 string with an
 /// explicit offset, plus the original TZID (if any) for round-trip export.
 ///
@@ -973,6 +1147,189 @@ END:VCALENDAR\r\n";
         let rows = ics_to_commitments(&parsed, None, None, None).expect("commitments");
         assert_eq!(rows.len(), 1);
         assert!(rows[0].series_uid.is_none());
+    }
+
+    #[test]
+    fn build_invitation_request_emits_method_request_and_rsvp() {
+        let now = Utc::now();
+        let c = Commitment {
+            id: "local-1".to_string(),
+            uid: "req-1@example.com".to_string(),
+            sequence: 0,
+            summary: Some("Kickoff".to_string()),
+            description: None,
+            location: None,
+            start_at: "2026-06-01T09:00:00+00:00".to_string(),
+            end_at: "2026-06-01T10:00:00+00:00".to_string(),
+            original_tzid: None,
+            organizer: Some(IcsParticipant {
+                email: "me@example.com".to_string(),
+                display_name: Some("Me".to_string()),
+                partstat: None,
+            }),
+            attendees: vec![
+                CommitmentAttendee {
+                    email: "bob@example.com".to_string(),
+                    display_name: Some("Bob".to_string()),
+                    partstat: None,
+                },
+                CommitmentAttendee {
+                    email: "carol@example.com".to_string(),
+                    display_name: None,
+                    partstat: None,
+                },
+            ],
+            source: CommitmentSource::Manual,
+            status: CommitmentStatus::Confirmed,
+            last_published_sequence: None,
+            source_message_id: None,
+            series_uid: None,
+            subscription_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let ics = build_invitation_request(&c);
+        // Long ATTENDEE lines get folded per RFC 5545 §3.1 — unfold
+        // before substring-asserting so the test isn't fragile to
+        // where the 75-octet boundary falls.
+        let unfolded = ics.replace("\r\n ", "");
+        assert!(unfolded.contains("METHOD:REQUEST"));
+        assert!(unfolded.contains("UID:req-1@example.com"));
+        assert!(unfolded.contains("ORGANIZER;CN=Me:mailto:me@example.com"));
+        assert!(unfolded.contains("RSVP=TRUE"));
+        assert!(unfolded.contains("ROLE=REQ-PARTICIPANT"));
+        assert!(unfolded.contains(":mailto:bob@example.com"));
+        assert!(unfolded.contains(":mailto:carol@example.com"));
+        // PARTSTAT defaults to NEEDS-ACTION even when stored attendees
+        // had something else — the recipient hasn't answered yet.
+        assert!(unfolded.contains("PARTSTAT=NEEDS-ACTION"));
+        assert!(unfolded.contains("STATUS:CONFIRMED"));
+    }
+
+    #[test]
+    fn apply_reply_stamps_partstat_on_matching_attendee() {
+        let now = Utc::now();
+        let c = Commitment {
+            id: "local-1".to_string(),
+            uid: "evt-1@example.com".to_string(),
+            sequence: 1,
+            summary: Some("Standup".to_string()),
+            description: None,
+            location: None,
+            start_at: "2026-06-01T09:00:00+00:00".to_string(),
+            end_at: "2026-06-01T10:00:00+00:00".to_string(),
+            original_tzid: None,
+            organizer: Some(IcsParticipant {
+                email: "me@example.com".to_string(),
+                display_name: None,
+                partstat: None,
+            }),
+            attendees: vec![
+                CommitmentAttendee {
+                    email: "BOB@example.com".to_string(),
+                    display_name: None,
+                    partstat: None,
+                },
+                CommitmentAttendee {
+                    email: "carol@example.com".to_string(),
+                    display_name: Some("Carol".to_string()),
+                    partstat: None,
+                },
+            ],
+            source: CommitmentSource::Manual,
+            status: CommitmentStatus::Confirmed,
+            last_published_sequence: None,
+            source_message_id: None,
+            series_uid: None,
+            subscription_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        // REPLY from Bob (lowercase in REPLY, mixed case stored — must
+        // still match) with PARTSTAT=ACCEPTED and a backfill name.
+        let reply_ics = "BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+METHOD:REPLY\r\n\
+PRODID:-//Bob's MUA//EN\r\n\
+BEGIN:VEVENT\r\n\
+UID:evt-1@example.com\r\n\
+SEQUENCE:1\r\n\
+DTSTAMP:20260601T080000Z\r\n\
+DTSTART:20260601T090000Z\r\n\
+DTEND:20260601T100000Z\r\n\
+ATTENDEE;CN=Bob Builder;PARTSTAT=ACCEPTED:mailto:bob@example.com\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR\r\n";
+        let reply = parse(reply_ics.as_bytes()).unwrap().unwrap();
+        assert_eq!(reply.method.as_deref(), Some("REPLY"));
+        assert_eq!(reply.attendees.len(), 1);
+        assert_eq!(reply.attendees[0].partstat.as_deref(), Some("ACCEPTED"));
+
+        let (updated, outcome) = apply_reply_to_commitment(&c, &reply);
+        assert_eq!(outcome, ReplyApplyOutcome::Applied);
+        let bob = updated
+            .attendees
+            .iter()
+            .find(|a| a.email.eq_ignore_ascii_case("bob@example.com"))
+            .unwrap();
+        assert_eq!(bob.partstat.as_deref(), Some("ACCEPTED"));
+        // Backfilled because original was None.
+        assert_eq!(bob.display_name.as_deref(), Some("Bob Builder"));
+        // Carol untouched.
+        let carol = updated
+            .attendees
+            .iter()
+            .find(|a| a.email == "carol@example.com")
+            .unwrap();
+        assert!(carol.partstat.is_none());
+        assert_eq!(carol.display_name.as_deref(), Some("Carol"));
+    }
+
+    #[test]
+    fn apply_reply_with_no_matching_attendee_returns_outcome() {
+        let now = Utc::now();
+        let c = Commitment {
+            id: "local-1".to_string(),
+            uid: "evt-1@example.com".to_string(),
+            sequence: 0,
+            summary: None,
+            description: None,
+            location: None,
+            start_at: "2026-06-01T09:00:00+00:00".to_string(),
+            end_at: "2026-06-01T10:00:00+00:00".to_string(),
+            original_tzid: None,
+            organizer: None,
+            attendees: vec![CommitmentAttendee {
+                email: "carol@example.com".to_string(),
+                display_name: None,
+                partstat: None,
+            }],
+            source: CommitmentSource::Manual,
+            status: CommitmentStatus::Confirmed,
+            last_published_sequence: None,
+            source_message_id: None,
+            series_uid: None,
+            subscription_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let reply_ics = "BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+METHOD:REPLY\r\n\
+PRODID:-//X//EN\r\n\
+BEGIN:VEVENT\r\n\
+UID:evt-1@example.com\r\n\
+SEQUENCE:0\r\n\
+DTSTAMP:20260601T080000Z\r\n\
+DTSTART:20260601T090000Z\r\n\
+DTEND:20260601T100000Z\r\n\
+ATTENDEE;PARTSTAT=DECLINED:mailto:stranger@example.com\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR\r\n";
+        let reply = parse(reply_ics.as_bytes()).unwrap().unwrap();
+        let (_unchanged, outcome) = apply_reply_to_commitment(&c, &reply);
+        assert_eq!(outcome, ReplyApplyOutcome::NoMatchingAttendee);
     }
 
     #[test]
