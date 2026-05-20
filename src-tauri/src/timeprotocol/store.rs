@@ -45,6 +45,97 @@ pub fn list_in_range(
     Ok(out)
 }
 
+/// List commitments touching at least one of the given email addresses,
+/// either as ORGANIZER or as an ATTENDEE row. Used by the ContactDetail
+/// "Termine"-Section to show a contact's upcoming/recent meetings.
+///
+/// - Emails are matched case-insensitively. Caller may pass them in any
+///   case; we lower-case both sides in the comparison.
+/// - The `[from, to)` window is checked against `start_at` only (not the
+///   start..end overlap rule `list_in_range` uses) — the calling UX
+///   ("Termine in den letzten 30 Tagen" / "Anstehend") is about *when
+///   the meeting begins*, not whether it spans the window.
+/// - CANCELLED rows are excluded.
+/// - Attendees are attached to each row so the UI can render
+///   PARTSTAT-Badges without a per-row round-trip.
+/// - Result limit guards against runaway queries on contacts with very
+///   long histories — practical max 200, the caller picks tighter.
+pub fn list_for_emails(
+    conn: &Connection,
+    emails: &[String],
+    from: &str,
+    to: &str,
+    limit: i64,
+) -> Result<Vec<Commitment>, DbError> {
+    if emails.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Build a parameter list of LOWER-cased emails so we can re-use the
+    // same `?N` slot for the organizer-equality check and for the
+    // inner attendee IN-clause. Saves us from binding the same vector
+    // twice.
+    let lowered: Vec<String> = emails
+        .iter()
+        .map(|e| e.trim().to_ascii_lowercase())
+        .filter(|e| !e.is_empty())
+        .collect();
+    if lowered.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = (0..lowered.len())
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
+    // Positional `?`: SQLite consumes one bind per `?` in left-to-right
+    // appearance. The email list appears in TWO IN-clauses (organizer
+    // + attendee EXISTS), so we bind it twice. Slot order:
+    //   from, to, emails×N, emails×N, limit.
+    let sql = format!(
+        "SELECT id, uid, sequence, summary, description, location,
+                start_at, end_at, original_tzid,
+                organizer_email, organizer_name,
+                source, source_message_id, created_at, updated_at, status,
+                last_published_sequence, series_uid
+         FROM commitments c
+         WHERE c.status != 'CANCELLED'
+           AND c.start_at >= ? AND c.start_at < ?
+           AND (
+             LOWER(IFNULL(c.organizer_email, '')) IN ({placeholders})
+             OR EXISTS (
+               SELECT 1 FROM commitment_attendees a
+               WHERE a.commitment_id = c.id
+                 AND LOWER(a.email) IN ({placeholders})
+             )
+           )
+         ORDER BY c.start_at ASC
+         LIMIT ?",
+        placeholders = placeholders,
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut binds: Vec<&dyn rusqlite::ToSql> =
+        Vec::with_capacity(2 * lowered.len() + 3);
+    binds.push(&from);
+    binds.push(&to);
+    for e in &lowered {
+        binds.push(e);
+    }
+    for e in &lowered {
+        binds.push(e);
+    }
+    binds.push(&limit);
+    let rows = stmt.query_map(
+        rusqlite::params_from_iter(binds.iter().copied()),
+        row_to_commitment_no_attendees,
+    )?;
+    let mut out = Vec::new();
+    for r in rows {
+        let mut c = r?;
+        c.attendees = fetch_attendees(conn, &c.id)?;
+        out.push(c);
+    }
+    Ok(out)
+}
+
 /// Fetch a single commitment with its attendees attached. Returns `None`
 /// when the id is unknown.
 pub fn get_with_attendees(
@@ -98,11 +189,10 @@ pub fn list_all_with_attendees(
     Ok(out)
 }
 
-/// Lookup by RFC 5545 UID. Currently unused at the call-site level (the
-/// import upsert resolves UID inline within its transaction), but kept on
-/// the read API surface for "is this invitation already in my calendar?"
-/// checks the UI may want later.
-#[allow(dead_code)]
+/// Lookup by RFC 5545 UID. Used by the inbound-REPLY path to find the
+/// local commitment a responder's PARTSTAT update applies to. The import
+/// upsert resolves UID inline within its own transaction (write-side),
+/// so this lives only on the read API.
 pub fn get_by_uid(
     conn: &Connection,
     uid: &str,
@@ -155,6 +245,9 @@ fn row_to_commitment_no_attendees(
     let organizer = organizer_email.map(|email| IcsParticipant {
         email,
         display_name: organizer_name,
+        // Stored row's organizer never carries PARTSTAT (organizer ≠
+        // attendee). The field exists purely for inbound-REPLY parsing.
+        partstat: None,
     });
     let source_str: String = row.get(11)?;
     let source = CommitmentSource::from_str(&source_str).unwrap_or(

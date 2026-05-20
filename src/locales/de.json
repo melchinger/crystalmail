@@ -18,6 +18,13 @@
     "attachmentTooltip": "Anhang vorhanden",
     "noSubject": "(kein Betreff)"
   },
+  "events": {
+    "extractFromMail": "Termin aus Mail",
+    "extractFromMailHint": "pi liest die Mail und schlägt einen Termin mit Titel, Zeit und Meeting-URL als Ort vor.",
+    "extractEmpty": "pi konnte keine Termindaten in dieser Mail erkennen.",
+    "extractNotApplicable": "Termin-Extraktion nicht möglich: {{reason}}",
+    "extractFailed": "Termin-Extraktion fehlgeschlagen: {{detail}}"
+  },
   "contacts": {
     "searchPlaceholder": "Kontakte suchen …",
     "createNew": "Neuen Kontakt anlegen",
@@ -62,6 +69,8 @@
     "delete": "Löschen",
     "confirmDelete": "Kontakt „{{name}}\" wirklich löschen? Die Verknüpfung zu Mails bleibt erhalten — nur die Stammdaten gehen weg.",
     "composeMail": "Mail schreiben",
+    "planMeeting": "Termin planen",
+    "planMeetingHint": "Neuen Termin anlegen mit diesem Kontakt als Teilnehmer",
     "extractedNotice": "Diese Stammdaten wurden automatisch aus einer Mail-Signatur extrahiert. Per „Aus Mail aktualisieren\" kannst du sie mit der neuesten Mail neu ableiten.",
     "reExtract": "Aus Mail aktualisieren",
     "reExtractHint": "Re-extrahiert die Stammdaten aus der jüngsten Mail dieses Kontakts.",
@@ -75,6 +84,13 @@
     "extractSkipped": "Übersprungen: {{reason}}",
     "extractFailed": "Extraktion fehlgeschlagen: {{detail}}",
     "openMessage": "Mail öffnen",
+    "events": {
+      "title": "Termine",
+      "upcoming": "Anstehend",
+      "past30": "Letzte 30 Tage",
+      "untitled": "(ohne Titel)",
+      "openTitle": "Termin im Kalender öffnen"
+    },
     "tagsSection": "Tags",
     "moreActions": "Weitere Aktionen",
     "exportVcf": "Exportieren als vCard (.vcf)",
@@ -159,6 +175,7 @@
     "sidebar": "Kalender",
     "invitation": {
       "label": "Termineinladung",
+      "replyLabel": "Antwort auf Einladung",
       "untitled": "(ohne Titel)",
       "when": "Wann",
       "where": "Wo",
@@ -175,6 +192,16 @@
         "accepted": "Ich habe die Einladung „{{summary}}\" angenommen.",
         "tentative": "Ich habe die Einladung „{{summary}}\" mit Vorbehalt angenommen.",
         "declined": "Ich habe die Einladung „{{summary}}\" abgelehnt."
+      },
+      "reply": {
+        "applying": "Antwort wird übernommen …",
+        "someone": "Eine eingeladene Person",
+        "verbAccepted": "{{who}} hat „{{summary}}\" zugesagt.",
+        "verbDeclined": "{{who}} hat „{{summary}}\" abgesagt.",
+        "verbTentative": "{{who}} hat „{{summary}}\" mit Vorbehalt zugesagt.",
+        "verbResponded": "{{who}} hat auf „{{summary}}\" geantwortet.",
+        "noLocalEvent": "Kein passender Termin im lokalen Kalender — vielleicht von einem anderen Gerät versendet.",
+        "unknownResponder": "Antwort kommt von einer nicht eingeladenen Adresse — nicht übernommen."
       }
     },
     "list": {
@@ -236,7 +263,36 @@
       "exportConsoleNotice": "ICS-Inhalt wurde in der Konsole abgelegt — Save-to-Disk landet in einer späteren Version.",
       "missingTime": "Beginn und Ende müssen gesetzt sein.",
       "endBeforeStart": "Das Ende liegt vor dem Beginn.",
-      "notFound": "Termin nicht gefunden."
+      "endTooSoon": "Das Ende muss mindestens 5 Minuten nach dem Beginn liegen.",
+      "notFound": "Termin nicht gefunden.",
+      "attendees": {
+        "label": "Teilnehmer",
+        "empty": "Noch keine Teilnehmer hinzugefügt.",
+        "add": "Hinzufügen",
+        "remove": "Entfernen",
+        "emailPlaceholder": "E-Mail-Adresse",
+        "namePlaceholder": "Name (optional)",
+        "invalidEmail": "Bitte eine gültige E-Mail-Adresse eingeben.",
+        "duplicate": "Diese Person ist bereits in der Liste.",
+        "partstatTooltip": "Antwort-Status laut letzter ICS-Mail",
+        "partstat": {
+          "ACCEPTED": "Zugesagt",
+          "DECLINED": "Abgesagt",
+          "TENTATIVE": "Vielleicht",
+          "NEEDS-ACTION": "Offen",
+          "DELEGATED": "Delegiert",
+          "UNKNOWN": "{{code}}"
+        },
+        "untitled": "(ohne Titel)"
+      },
+      "sendInvitation": {
+        "label": "Einladung versenden",
+        "tooltip": "ICS-Einladung an alle Teilnehmer als Mail vorbereiten (Compose öffnet sich)",
+        "fromAccount": "Absender-Konto",
+        "onlySelf": "Mindestens ein Teilnehmer außer dir selbst nötig.",
+        "subject": "Einladung: {{summary}}",
+        "body": "Ich möchte dich zu „{{summary}}\" einladen. Die Termindetails sind als iCalendar-Datei angehängt — dein Mailprogramm/Kalender kann sie direkt übernehmen."
+      }
     }
   },
   "meetingOverlay": {

@@ -327,7 +327,7 @@ pub async fn extract_for_message(
         "{}\n\n--- BEGIN E-MAIL ---\n{}\n--- END E-MAIL ---",
         prompt_template, body_for_pi
     );
-    let json_text = call_pi(&app, prompt).await?;
+    let json_text = call_pi(&app, prompt, PI_TIMEOUT_SECS).await?;
 
     // ── 7. Parse + Persist ─────────────────────────────────────────
     let extracted = parse_extracted_json(&json_text)?;
@@ -420,7 +420,16 @@ pub async fn extract_for_message(
 /// Pi-Call mit Timeout. Wir nutzen die globale pi_config aus AppState
 /// statt einer eigenen — sonst hätten wir N parallel-laufende pi-
 /// Subprozesse mit unterschiedlichem State.
-async fn call_pi(app: &AppHandle, prompt: String) -> Result<String, String> {
+///
+/// Pub damit `event_extract` und andere extraction-Pipelines denselben
+/// Pi-Pfad teilen. `timeout_secs` ist per-Caller, weil verschiedene
+/// Tasks unterschiedliche Input-Größen + Token-Budgets haben
+/// (Termin-Extraktion füttert mehr Body als Kontakt-Extraktion).
+pub async fn call_pi(
+    app: &AppHandle,
+    prompt: String,
+    timeout_secs: u64,
+) -> Result<String, String> {
     use tauri::Manager;
     let state = app.state::<crate::state::AppState>();
     let cfg = {
@@ -433,7 +442,7 @@ async fn call_pi(app: &AppHandle, prompt: String) -> Result<String, String> {
 
     let rpc = crate::llm::pi_rpc::PiRpc::spawn(app.clone(), &cfg).await?;
     let result = tokio::time::timeout(
-        std::time::Duration::from_secs(PI_TIMEOUT_SECS),
+        std::time::Duration::from_secs(timeout_secs),
         rpc.prompt_collect(prompt),
     )
     .await;
@@ -442,7 +451,7 @@ async fn call_pi(app: &AppHandle, prompt: String) -> Result<String, String> {
         Ok(Ok(text)) => Ok(text),
         Ok(Err(e)) => Err(format!("pi-Call: {e}")),
         Err(_) => Err(format!(
-            "pi-Call dauerte länger als {PI_TIMEOUT_SECS}s — Modell zu groß?"
+            "pi-Call dauerte länger als {timeout_secs}s — Modell zu groß?"
         )),
     }
 }
@@ -464,7 +473,10 @@ fn parse_extracted_json(raw: &str) -> Result<ExtractedFields, String> {
     Ok(extracted)
 }
 
-fn first_balanced_object(s: &str) -> Option<String> {
+/// Extrahiert das erste balancierte `{...}` aus pi-Antworten. Pub damit
+/// andere extraction-Pipelines (event_extract o.a.) denselben
+/// Tolerance-Layer für vor/nach-Text und String-Escapes nutzen können.
+pub fn first_balanced_object(s: &str) -> Option<String> {
     let bytes = s.as_bytes();
     let mut start: Option<usize> = None;
     let mut depth = 0i32;

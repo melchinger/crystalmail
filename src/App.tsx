@@ -51,6 +51,7 @@ import {
 } from "./utils/recentSearches";
 import type {
   AccountSummary,
+  CommitmentAttendee,
   ComposeDraft,
   EnvelopeSummary,
   MessageDetail,
@@ -213,6 +214,34 @@ export function App() {
   // Bumpt bei create/update/delete damit ContactsView neu lädt ohne
   // dass wir interne refresh-Pfade in der View brauchen.
   const [contactsRefreshKey, setContactsRefreshKey] = useState(0);
+  // Deep-Link in den Kalender: wenn aus dem ContactDetail auf einen
+  // Termin geklickt wird, hinterlegen wir hier die commitment-id und
+  // wechseln den Folder. Die CalendarView konsumiert das beim Mount/
+  // Prop-Change, öffnet den EventEditor und ruft das clear-callback
+  // damit ein zweiter Klick auf denselben Termin erneut auslöst.
+  const [pendingOpenCommitmentId, setPendingOpenCommitmentId] = useState<
+    string | null
+  >(null);
+  // "Termin planen mit Kontakt"-Deep-Link: CalendarView öffnet im
+  // create-mode mit dem Attendee vorbefüllt. Eigene State-Slot statt
+  // Recycling von `pendingOpenCommitmentId`, sonst kollidieren beide
+  // Pfade falls der User schnell hintereinander zwei Aktionen
+  // triggert.
+  const [pendingNewEventAttendee, setPendingNewEventAttendee] = useState<
+    CommitmentAttendee | null
+  >(null);
+  // "Termin aus Mail"-Pfad: pi hat in der gerade gelesenen Mail
+  // Termin-Daten erkannt → wir öffnen den Editor mit dem Draft
+  // vorbefüllt. Felder kommen schon im EventEditor-Format (naïve
+  // local time strings); App reicht das durch ohne weitere
+  // Konvertierung.
+  const [pendingNewEventSeed, setPendingNewEventSeed] = useState<{
+    summary?: string;
+    location?: string;
+    description?: string;
+    startAt?: string;
+    endAt?: string;
+  } | null>(null);
   const [hotkeyHelp, setHotkeyHelp] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   // Optional deep-link target when opening Settings — e.g. the
@@ -1901,7 +1930,23 @@ export function App() {
         />
         {activeFolder === "calendar" ? (
           <div className="min-h-0 flex-1">
-            <CalendarView />
+            <CalendarView
+              accounts={accounts}
+              onCompose={(d) => setComposeDraft(d)}
+              openCommitmentId={pendingOpenCommitmentId}
+              onOpenedCommitment={() => setPendingOpenCommitmentId(null)}
+              seedNewEvent={
+                pendingNewEventSeed
+                  ? pendingNewEventSeed
+                  : pendingNewEventAttendee
+                    ? { attendees: [pendingNewEventAttendee] }
+                    : null
+              }
+              onSeededNewEvent={() => {
+                setPendingNewEventAttendee(null);
+                setPendingNewEventSeed(null);
+              }}
+            />
           </div>
         ) : activeFolder === "contacts" ? (
           <>
@@ -1946,6 +1991,23 @@ export function App() {
                   // aus envelope.folderId zu finden.
                   setActiveFolder("unified");
                   setSelectedId(id);
+                }}
+                onOpenEvent={(commitmentId) => {
+                  // Sprung in den Kalender + EventEditor für den
+                  // gewählten Termin. CalendarView ist beim
+                  // Folder-Switch nicht gemountet — also setzen wir
+                  // den pending-state *vor* dem Folder-Wechsel und
+                  // lassen die View beim Mount darauf reagieren.
+                  setPendingOpenCommitmentId(commitmentId);
+                  setActiveFolder("calendar");
+                }}
+                onPlanMeeting={(attendee) => {
+                  // Spiegelpfad: Termin neu anlegen mit dem Kontakt
+                  // schon auf der Einladungsliste. Folder-Switch
+                  // mountet CalendarView, der useEffect dort öffnet
+                  // den EventEditor im create-mode.
+                  setPendingNewEventAttendee(attendee);
+                  setActiveFolder("calendar");
                 }}
               />
             </div>
@@ -2053,6 +2115,14 @@ export function App() {
           onShowContact={(id) => {
             setSelectedContactId(id);
             setActiveFolder("contacts");
+          }}
+          onPlanEventFromMail={(seed) => {
+            // pi-extracted Termin-Draft aus der Reader-Mail. Spiegel-
+            // pfad zu `onPlanMeeting` aus dem Kontakt — wir setzen den
+            // Seed und wechseln in den Kalender. CalendarView öffnet
+            // den EventEditor mit den vorbefüllten Feldern.
+            setPendingNewEventSeed(seed);
+            setActiveFolder("calendar");
           }}
           onFlagsChanged={(id, flags) => {
             // Mirror the change into the inbox list so the unread/answered/

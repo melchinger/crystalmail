@@ -410,6 +410,10 @@ export type AttachmentMeta = {
 export type IcsParticipant = {
   email: string;
   displayName: string | null;
+  /** RFC 5545 PARTSTAT (`ACCEPTED`, `DECLINED`, …) when present on an
+   *  ATTENDEE line. Always null/undefined for ORGANIZER. Surfaced so the
+   *  inbound REPLY path can read the responder's status. */
+  partstat?: string | null;
 };
 
 export type ParsedIcsEvent = {
@@ -519,6 +523,39 @@ export type ExportedIcs = {
   filename: string;
   /** Set when the export call also wrote the blob to a path on disk. */
   writtenTo: string | null;
+};
+
+/** Backend `cal_extract_from_message` result. Mirror of Rust
+ *  `EventExtractionResult`. `found` = pi liefered a valid draft and the
+ *  frontend opens the EventEditor pre-filled; `empty` = pi ran but
+ *  recognised nothing actionable (UI shows toast); `not_applicable` =
+ *  structural problem (no mail, empty body, pi unreachable). */
+export type EventExtractionResult =
+  | { kind: "found"; draft: ExtractedEventDraft }
+  | { kind: "empty" }
+  | { kind: "not_applicable"; reason: string };
+
+export type ExtractedEventDraft = {
+  summary: string;
+  /** Naive local datetime — `YYYY-MM-DDTHH:MM`, no TZ offset. Frontend
+   *  applies the system offset when persisting (same path used for
+   *  HTML5 `datetime-local` inputs). */
+  startLocal: string;
+  endLocal: string;
+  location: string;
+  description: string;
+};
+
+/** Backend `cal_build_invitation_request` result. The commitment is the
+ *  freshly-persisted row (SEQUENCE bumped, ORGANIZER stamped) — the
+ *  frontend swaps this in to avoid a second round-trip. */
+export type InvitationRequestDraft = {
+  commitment: Commitment;
+  recipients: IcsParticipant[];
+  eventSummary: string | null;
+  attachmentPath: string;
+  attachmentFilename: string;
+  attachmentSizeBytes: number;
 };
 
 /** Result of `cal_import_ics_file`. `imported` and `skipped` together

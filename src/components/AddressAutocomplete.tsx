@@ -7,14 +7,29 @@ type Props = {
    *  und positionieren das Dropdown direkt drunter, damit es bei
    *  Resize/Scroll mitwandert ohne Layout-Pflege im Parent. */
   anchorRef: React.RefObject<HTMLInputElement>;
-  /** Aktueller Wert des Inputs — wir suchen nach dem Token rechts vom
-   *  letzten Komma (Mehrfach-Empfänger-Eingabe wie "alice@x.de, bob"). */
+  /** Aktueller Wert des Inputs — bei `mode="compose"` suchen wir nach
+   *  dem Token rechts vom letzten Komma (Mehrfach-Empfänger-Eingabe wie
+   *  "alice@x.de, bob"); bei `mode="single"` ist `value` selbst der
+   *  Prefix. */
   value: string;
-  /** Wenn der User eine Auswahl bestätigt: ersetze den letzten Token
-   *  durch das gewählte Item. Caller setzt damit den Input-State. */
-  onPick: (formatted: string) => void;
+  /** Bei `mode="compose"` aufgerufen wenn der User eine Auswahl
+   *  bestätigt: ersetzt den letzten Token durch das gewählte Item.
+   *  Caller setzt damit den Input-State. Optional, wenn
+   *  `onPickContact` reicht. */
+  onPick?: (formatted: string) => void;
+  /** Alternativ-Callback: liefert das komplette Completion-Objekt
+   *  zurück, damit der Caller frei entscheiden kann was passieren soll
+   *  (Email-Feld füllen, Name-Feld füllen, Liste erweitern). Hat
+   *  Vorrang vor `onPick` wenn beide gesetzt sind. Pflicht bei
+   *  `mode="single"`. */
+  onPickContact?: (c: AddressCompletion) => void;
   /** Optional: open/close-Steuerung via Parent (Esc, Click-outside). */
   onClose?: () => void;
+  /** `"compose"` (default): Komma-Liste, der letzte Token ist der
+   *  Suchprefix, Pick fügt den gewählten Adressblock am Token-Ende
+   *  ein. `"single"`: ein Input = ein Empfänger, Pick ersetzt komplett
+   *  und der Caller entscheidet via `onPickContact` was passiert. */
+  mode?: "compose" | "single";
 };
 
 /** Mindest-Prefix-Länge bevor wir das Backend belasten. 1 Zeichen würde
@@ -55,7 +70,9 @@ export function AddressAutocomplete({
   anchorRef,
   value,
   onPick,
+  onPickContact,
   onClose,
+  mode = "compose",
 }: Props) {
   const [items, setItems] = useState<AddressCompletion[]>([]);
   const [highlight, setHighlight] = useState(0);
@@ -65,7 +82,30 @@ export function AddressAutocomplete({
   const debounceRef = useRef<number | null>(null);
   const lastQueryRef = useRef<string>("");
 
-  const { prefix, head } = lastToken(value);
+  // Single-mode: whole input is the prefix, no comma-token slicing,
+  // no "head" prefix to splice in front of the picked address.
+  const { prefix, head } =
+    mode === "single"
+      ? { prefix: value.trim(), head: "" }
+      : lastToken(value);
+
+  // Shared selection dispatcher. `onPickContact` is the semantic-level
+  // hook (gets the full object); `onPick` is the legacy
+  // formatted-string hook used by Compose. We prefer Contact when both
+  // are wired so a future call-site can opt into the richer API
+  // without removing onPick for callers that still rely on it.
+  const dispatchPick = (c: AddressCompletion) => {
+    if (onPickContact) {
+      onPickContact(c);
+      return;
+    }
+    if (onPick) {
+      const formatted = formatAddress(c);
+      onPick(
+        mode === "single" ? formatted : `${head}${formatted}, `,
+      );
+    }
+  };
 
   // Debounced Backend-Lookup. Cancel pending lookups wenn der User
   // weitertippt — sonst kommt die alte Antwort zurück und überschreibt
@@ -147,8 +187,7 @@ export function AddressAutocomplete({
           {
             const picked = items[highlight];
             if (picked) {
-              const formatted = formatAddress(picked);
-              onPick(`${head}${formatted}, `);
+              dispatchPick(picked);
             }
           }
           setItems([]);
@@ -162,7 +201,8 @@ export function AddressAutocomplete({
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [items, highlight, head, onPick, onClose, anchorRef]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [items, highlight, onPick, onPickContact, onClose, anchorRef, mode]);
 
   if (items.length === 0 || !box) return null;
 
@@ -194,12 +234,11 @@ export function AddressAutocomplete({
             }}
             onMouseEnter={() => setHighlight(i)}
             // mousedown statt click: input verliert sonst Focus bevor
-            // unser onPick durchläuft — preventDefault hält den Focus
+            // unser Pick durchläuft — preventDefault hält den Focus
             // im Input.
             onMouseDown={(e) => {
               e.preventDefault();
-              const formatted = formatAddress(c);
-              onPick(`${head}${formatted}, `);
+              dispatchPick(c);
               setItems([]);
             }}
           >

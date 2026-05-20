@@ -14,9 +14,12 @@ import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import type {
+  AccountSummary,
   CalendarSubscription,
   CalendarSyncReport,
   Commitment,
+  CommitmentAttendee,
+  ComposeDraft,
   IcsImportReport,
 } from "../types";
 import { CalendarMonthView } from "./CalendarMonthView";
@@ -27,6 +30,20 @@ import { NegotiationStartDialog } from "./NegotiationStartDialog";
 type EditorState =
   | { mode: "create" }
   | { mode: "create"; initialStartAt: string; initialEndAt: string }
+  | { mode: "create"; initialAttendees: CommitmentAttendee[] }
+  | {
+      mode: "create";
+      /** Mail-extraction-Seed: alle Felder optional, EventEditor füllt
+       *  was vorhanden ist. Eigene Variante (statt einer aufgeblähten
+       *  obigen) damit die Diskriminierungs-Branches simpel bleiben. */
+      seed: {
+        summary?: string;
+        location?: string;
+        description?: string;
+        startAt?: string;
+        endAt?: string;
+      };
+    }
   | { mode: "edit"; commitmentId: string }
   | null;
 
@@ -36,7 +53,46 @@ const VIEW_MODE_STORAGE_KEY = "crystalmail.calendar.viewMode";
 
 type Bucket = "past" | "today" | "thisWeek" | "later";
 
-export function CalendarView() {
+type Props = {
+  /** Loaded once at app startup; threaded down so the EventEditor can
+   *  resolve the sending account for "Einladung versenden" without an
+   *  extra `list_accounts` round-trip. */
+  accounts: AccountSummary[];
+  /** Hand a draft up to App so Compose opens with our prefilled REQUEST
+   *  ICS attachment. Same plumbing the IcsInvitePanel uses for REPLY. */
+  onCompose: (draft: ComposeDraft) => void;
+  /** Deep-Link aus ContactDetail: wenn gesetzt, beim Mount/Prop-Change
+   *  den EventEditor für diese commitment-id im edit-mode öffnen.
+   *  Wird nach Konsum via `onOpenedCommitment` zurückgesetzt — sonst
+   *  würde ein zweiter Klick auf denselben Termin (gleicher Wert)
+   *  keinen Effect-Run auslösen. */
+  openCommitmentId?: string | null;
+  onOpenedCommitment?: () => void;
+  /** Deep-Link aus ContactDetail / Reader: öffnet EventEditor im
+   *  create-mode mit Feldern aus dem Seed vorbefüllt. Zwei Pfade
+   *  nutzen das:
+   *  - "Termin planen mit Kontakt" — nur `attendees` gesetzt.
+   *  - "Termin aus Mail" — Title/Zeit/Ort/Beschreibung gesetzt.
+   *  Beide One-Shot: nach Konsum via `onSeededNewEvent` zurücksetzen. */
+  seedNewEvent?: {
+    attendees?: CommitmentAttendee[];
+    summary?: string;
+    location?: string;
+    description?: string;
+    startAt?: string;
+    endAt?: string;
+  } | null;
+  onSeededNewEvent?: () => void;
+};
+
+export function CalendarView({
+  accounts,
+  onCompose,
+  openCommitmentId,
+  onOpenedCommitment,
+  seedNewEvent,
+  onSeededNewEvent,
+}: Props) {
   const { t } = useTranslation();
   const [events, setEvents] = useState<Commitment[] | null>(null);
   // Subscriptions are loaded alongside events so the views can tint
@@ -104,6 +160,54 @@ export function CalendarView() {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  // Deep-Link-Konsum: ein gesetztes `openCommitmentId` ⇒ EventEditor im
+  // edit-mode für genau diese row öffnen. Nach dem State-Push den
+  // parent-state via callback clearen, damit ein erneuter Klick auf
+  // denselben Termin (identischer Wert) den Effect wieder auslöst —
+  // ohne das clear wäre der zweite Klick ein No-Op weil die deps-Liste
+  // gleich bleibt.
+  useEffect(() => {
+    if (!openCommitmentId) return;
+    setEditor({ mode: "edit", commitmentId: openCommitmentId });
+    onOpenedCommitment?.();
+  }, [openCommitmentId, onOpenedCommitment]);
+
+  // Gleiches Muster für "Termin planen mit Kontakt" + "Termin aus
+  // Mail": öffnet create-mode mit vorbefüllten Feldern. App.tsx setzt
+  // immer nur einen pending-State zur Zeit.
+  useEffect(() => {
+    if (!seedNewEvent) return;
+    const hasAttendees =
+      !!seedNewEvent.attendees && seedNewEvent.attendees.length > 0;
+    const hasContent =
+      !!seedNewEvent.summary ||
+      !!seedNewEvent.location ||
+      !!seedNewEvent.description ||
+      !!seedNewEvent.startAt;
+    if (!hasAttendees && !hasContent) return;
+    if (hasContent) {
+      // Mail-extraction-Pfad: nutze die generische `seed`-Variante,
+      // die EventEditor unter den initialXxx-Props auspackt.
+      setEditor({
+        mode: "create",
+        seed: {
+          summary: seedNewEvent.summary,
+          location: seedNewEvent.location,
+          description: seedNewEvent.description,
+          startAt: seedNewEvent.startAt,
+          endAt: seedNewEvent.endAt,
+        },
+      });
+    } else {
+      // Reines Kontakt-Plan: nur attendees.
+      setEditor({
+        mode: "create",
+        initialAttendees: seedNewEvent.attendees!,
+      });
+    }
+    onSeededNewEvent?.();
+  }, [seedNewEvent, onSeededNewEvent]);
 
   const handleImportFile = useCallback(async () => {
     try {
@@ -451,13 +555,39 @@ export function CalendarView() {
           initialStartAt={
             editor.mode === "create" && "initialStartAt" in editor
               ? editor.initialStartAt
-              : null
+              : editor.mode === "create" && "seed" in editor
+                ? editor.seed.startAt ?? null
+                : null
           }
           initialEndAt={
             editor.mode === "create" && "initialEndAt" in editor
               ? editor.initialEndAt
+              : editor.mode === "create" && "seed" in editor
+                ? editor.seed.endAt ?? null
+                : null
+          }
+          initialAttendees={
+            editor.mode === "create" && "initialAttendees" in editor
+              ? editor.initialAttendees
               : null
           }
+          initialSummary={
+            editor.mode === "create" && "seed" in editor
+              ? editor.seed.summary ?? null
+              : null
+          }
+          initialLocation={
+            editor.mode === "create" && "seed" in editor
+              ? editor.seed.location ?? null
+              : null
+          }
+          initialDescription={
+            editor.mode === "create" && "seed" in editor
+              ? editor.seed.description ?? null
+              : null
+          }
+          accounts={accounts}
+          onCompose={onCompose}
           onClose={() => setEditor(null)}
           onSaved={() => {
             setEditor(null);

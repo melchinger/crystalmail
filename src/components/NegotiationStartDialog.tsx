@@ -5,10 +5,11 @@
 // counterparty's Reader (or in our own threads later, once we add a
 // negotiations list view in 3.5+).
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import type { AccountSummary, Negotiation } from "../types";
+import { AddressAutocomplete } from "./AddressAutocomplete";
 
 type Props = {
   onClose: () => void;
@@ -37,6 +38,12 @@ export function NegotiationStartDialog({ onClose, onSent }: Props) {
   const [minimumNotice, setMinimumNotice] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Anker für `<AddressAutocomplete mode="single">`. Single-Mode liefert
+  // den ganzen AddressCompletion-Datensatz an `onPickContact`; wir nehmen
+  // nur die bare Email — die Backend-Command `tp_send_initial_request`
+  // erwartet eine reine Adresse (kein Name/Display), trimmt dann nochmal
+  // selbst. Konsistent mit dem EventEditor-Attendee-Pfad.
+  const toInputRef = useRef<HTMLInputElement>(null);
 
   // Load accounts + the calendar-config-account as the default sender.
   useEffect(() => {
@@ -142,6 +149,7 @@ export function NegotiationStartDialog({ onClose, onSent }: Props) {
 
           <Field label={t("negotiation.start.to")}>
             <input
+              ref={toInputRef}
               type="email"
               value={toEmail}
               onChange={(e) => setToEmail(e.target.value)}
@@ -154,6 +162,20 @@ export function NegotiationStartDialog({ onClose, onSent }: Props) {
               }}
               required
               autoFocus
+              autoComplete="off"
+            />
+            <AddressAutocomplete
+              anchorRef={toInputRef}
+              value={toEmail}
+              mode="single"
+              onPickContact={(c) => {
+                // Single-Empfänger: nur die Email — der Display-Name aus
+                // dem Adressbuch landet nicht im Feld, weil das Backend
+                // hier eine reine `toEmail` erwartet (im Gegensatz zu
+                // Compose, das den ganzen RFC-2822-Block braucht).
+                setToEmail(c.email);
+                setError(null);
+              }}
             />
           </Field>
 

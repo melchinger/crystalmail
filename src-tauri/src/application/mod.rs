@@ -7,6 +7,7 @@ pub mod body_essentials;
 pub mod calendar_actor;
 pub mod calendar_imap;
 pub mod contact_extract;
+pub mod event_extract;
 pub mod contacts_io;
 pub mod draft_import;
 pub mod flags;

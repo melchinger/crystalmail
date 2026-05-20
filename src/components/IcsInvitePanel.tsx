@@ -1,9 +1,12 @@
-// Phase 0 calendar UI: when the open mail carries a `text/calendar`
-// attachment that looks like an invitation, we show a small panel above
-// the body with summary/time/organizer and three response buttons. No
-// local store, no calendar view — clicking a button only builds an
-// RFC 5546 REPLY ICS, drops it into a Compose draft pre-addressed to the
-// organizer, and the user sends manually.
+// Calendar UI for mails carrying a `text/calendar` attachment. Three flavors:
+//   - METHOD:REQUEST (or attendees, no method) — invitation we received.
+//     Three response buttons (Accept/Tentative/Decline) — clicking builds
+//     an RFC 5546 REPLY ICS, drops it into a Compose draft pre-addressed
+//     to the organizer.
+//   - METHOD:REPLY — someone we invited responded. We auto-apply the
+//     PARTSTAT to the matching local commitment on mount and show a
+//     "Bob hat zugesagt zu X" status line.
+//   - METHOD:CANCEL — not handled here (future).
 
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -17,6 +20,17 @@ import type {
   InvitationResponse,
   ParsedIcsEvent,
 } from "../types";
+
+/** Backend `cal_apply_invitation_reply` result. Mirror of the Rust
+ *  `InvitationReplyApplied`. */
+type InvitationReplyApplied = {
+  uid: string;
+  outcome: "applied" | "noMatchingCommitment" | "noMatchingAttendee";
+  responderPartstat: string | null;
+  responderEmail: string | null;
+  responderDisplayName: string | null;
+  commitment: unknown | null;
+};
 
 type Props = {
   messageId: string;
@@ -46,6 +60,11 @@ export function IcsInvitePanel({
 
   const [event, setEvent] = useState<ParsedIcsEvent | null>(null);
   const [busy, setBusy] = useState(false);
+  // REPLY branch only: filled by the auto-apply effect below. Null until
+  // the apply finishes (or stays null when this isn't a REPLY).
+  const [replyResult, setReplyResult] = useState<InvitationReplyApplied | null>(
+    null,
+  );
   // Tracks the (messageId, partIdx) pair that was last parsed. Without it,
   // navigating from mail A → mail B → mail A could leave a stale event from
   // A's first parse if B's parse is in flight when we re-mount.
@@ -54,12 +73,14 @@ export function IcsInvitePanel({
   useEffect(() => {
     if (!ics) {
       setEvent(null);
+      setReplyResult(null);
       liveRef.current = null;
       return;
     }
     const target = { messageId, partIdx: ics.partIdx };
     liveRef.current = target;
     setEvent(null);
+    setReplyResult(null);
     void (async () => {
       try {
         const parsed = await invoke<ParsedIcsEvent | null>(
@@ -67,13 +88,39 @@ export function IcsInvitePanel({
           { messageId, partIdx: ics.partIdx },
         );
         if (
-          liveRef.current?.messageId === target.messageId &&
-          liveRef.current?.partIdx === target.partIdx
+          liveRef.current?.messageId !== target.messageId ||
+          liveRef.current?.partIdx !== target.partIdx
         ) {
-          setEvent(parsed);
+          return;
+        }
+        setEvent(parsed);
+        // REPLY auto-apply: when the inbound ICS announces it's a REPLY,
+        // push the PARTSTAT into the matching local commitment. This is
+        // idempotent (re-opening the mail just writes the same value),
+        // and the backend silently skips when the UID doesn't resolve —
+        // so we can fire-and-await without risking weird state.
+        const isReply =
+          parsed?.method?.toUpperCase() === "REPLY";
+        if (isReply) {
+          try {
+            const applied = await invoke<InvitationReplyApplied>(
+              "cal_apply_invitation_reply",
+              { messageId, partIdx: ics.partIdx },
+            );
+            if (
+              liveRef.current?.messageId === target.messageId &&
+              liveRef.current?.partIdx === target.partIdx
+            ) {
+              setReplyResult(applied);
+            }
+          } catch (err) {
+            // Apply failures don't block the panel — we still want to
+            // show "what is this mail" metadata. Logs go to dev console.
+            console.warn("apply reply failed", err);
+          }
         }
       } catch (err) {
-        // Malformed ICS isn't a user-facing error — Phase 0 is best-effort
+        // Malformed ICS isn't a user-facing error — best-effort
         // recognition. Logging keeps the dev console useful without
         // surfacing a banner the user can't act on.
         console.warn("ics parse failed", err);
@@ -88,10 +135,12 @@ export function IcsInvitePanel({
   }, [messageId, ics?.partIdx]);
 
   if (!ics || !event) return null;
-  // Calendar publications without attendees can't be replied to — we still
-  // show the event metadata but hide the response buttons so the user gets
-  // an at-a-glance view without a misleading "Annehmen" that goes nowhere.
-  const canRespond = event.isInvitation && event.organizer !== null;
+  const isReply = event.method?.toUpperCase() === "REPLY";
+  // Calendar publications without attendees can't be replied to, and
+  // REPLY mails are responses *to* us — neither shows the response
+  // buttons. We still render event metadata for both.
+  const canRespond =
+    !isReply && event.isInvitation && event.organizer !== null;
 
   const handleRespond = async (response: InvitationResponse) => {
     if (!ics || !account || busy) return;
@@ -143,7 +192,9 @@ export function IcsInvitePanel({
         className="text-[11px] uppercase tracking-wide"
         style={{ color: "var(--fg-subtle)" }}
       >
-        {t("calendar.invitation.label")}
+        {isReply
+          ? t("calendar.invitation.replyLabel")
+          : t("calendar.invitation.label")}
       </div>
       <div
         className="mt-0.5 truncate text-base font-medium"
@@ -202,6 +253,10 @@ export function IcsInvitePanel({
           />
         </div>
       )}
+
+      {isReply && (
+        <ReplyStatus result={replyResult} eventSummary={event.summary} />
+      )}
     </div>
   );
 }
@@ -237,6 +292,69 @@ function ResponseButton({
     >
       {label}
     </button>
+  );
+}
+
+/** Status line for incoming REPLY mails. Shows "Bob hat zugesagt zu X"
+ *  (or declined/tentative) once the backend's apply call returns. While
+ *  the apply is still in flight, renders a subtle "wird gespeichert …"
+ *  placeholder so the user knows something happened. */
+function ReplyStatus({
+  result,
+  eventSummary,
+}: {
+  result: InvitationReplyApplied | null;
+  eventSummary: string | null;
+}) {
+  const { t } = useTranslation();
+  // In-flight: backend hasn't reported back yet.
+  if (!result) {
+    return (
+      <div
+        className="mt-2 text-xs"
+        style={{ color: "var(--fg-subtle)" }}
+      >
+        {t("calendar.invitation.reply.applying")}
+      </div>
+    );
+  }
+  const summary = eventSummary ?? t("calendar.invitation.untitled");
+  const who =
+    result.responderDisplayName ?? result.responderEmail ?? t("calendar.invitation.reply.someone");
+  const partstat = (result.responderPartstat ?? "").toUpperCase();
+  // Map PARTSTAT → human verb. NEEDS-ACTION on a REPLY is weird but
+  // legal (responder is signalling "I see this, will decide later").
+  const verbKey =
+    partstat === "ACCEPTED"
+      ? "calendar.invitation.reply.verbAccepted"
+      : partstat === "DECLINED"
+        ? "calendar.invitation.reply.verbDeclined"
+        : partstat === "TENTATIVE"
+          ? "calendar.invitation.reply.verbTentative"
+          : "calendar.invitation.reply.verbResponded";
+  const headline = t(verbKey, { who, summary });
+
+  const tone =
+    partstat === "ACCEPTED"
+      ? "var(--fg-success, #2a8a3e)"
+      : partstat === "DECLINED"
+        ? "var(--fg-error, #c00)"
+        : "var(--fg-muted)";
+
+  let note: string | null = null;
+  if (result.outcome === "noMatchingCommitment") {
+    note = t("calendar.invitation.reply.noLocalEvent");
+  } else if (result.outcome === "noMatchingAttendee") {
+    note = t("calendar.invitation.reply.unknownResponder");
+  }
+
+  return (
+    <div className="mt-2 flex flex-col gap-0.5 text-xs">
+      <div style={{ color: tone, fontWeight: 500 }}>{headline}</div>
+      {note && (
+        <div style={{ color: "var(--fg-subtle)" }}>{note}</div>
+      )}
+    </div>
   );
 }
 

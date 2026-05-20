@@ -3,6 +3,8 @@ import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { TagEditor } from "./TagEditor";
 import type {
+  Commitment,
+  CommitmentAttendee,
   ComposeDraft,
   ContactDetail as ContactDetailType,
   ContactForm,
@@ -24,6 +26,14 @@ type Props = {
    *  springt aus dem Kontakte-Mode zurück in die Mail-Ansicht und
    *  öffnet den Envelope. */
   onOpenMessage: (messageId: string) => void;
+  /** Klick auf einen Termin in der "Termine"-Liste — Caller wechselt
+   *  in den Kalender-Mode und öffnet den EventEditor für genau diese
+   *  commitment-id. */
+  onOpenEvent: (commitmentId: string) => void;
+  /** Klick auf "Termin planen" — Caller wechselt in den Kalender-Mode
+   *  und öffnet den EventEditor im create-mode mit dem Kontakt schon
+   *  als Attendee. Spiegelpfad zu `onCompose` für Mails. */
+  onPlanMeeting: (attendee: CommitmentAttendee) => void;
 };
 
 const EMPTY_FORM: ContactForm = {
@@ -66,6 +76,8 @@ export function ContactDetail({
   onCancel,
   onCompose,
   onOpenMessage,
+  onOpenEvent,
+  onPlanMeeting,
 }: Props) {
   const { t } = useTranslation();
   const [detail, setDetail] = useState<ContactDetailType | null>(null);
@@ -74,6 +86,7 @@ export function ContactDetail({
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [messages, setMessages] = useState<EnvelopeSummary[]>([]);
+  const [events, setEvents] = useState<Commitment[]>([]);
   const [extracting, setExtracting] = useState(false);
   // E-Mail-Adresse-Hinzufügen-Modal — ersetzt das hässliche
   // window.prompt mit einem app-stiligen Dialog.
@@ -86,11 +99,13 @@ export function ContactDetail({
       setForm(EMPTY_FORM);
       setEditing(true);
       setMessages([]);
+      setEvents([]);
       return;
     }
     if (!contactId) {
       setDetail(null);
       setMessages([]);
+      setEvents([]);
       return;
     }
     setError(null);
@@ -99,12 +114,39 @@ export function ContactDetail({
       setDetail(d);
       setForm(formFromDetail(d));
       setEditing(false);
+      // 5 reicht für die "Letzte Mails"-Sektion. Hinweis: der
+      // `reExtract`-Pfad nimmt `messages[0]` als jüngste Mail — bleibt
+      // mit 5 statt 50 weiterhin gültig, weil die Sortierung
+      // (date_utc DESC) auf Backend-Seite passiert.
       const m = await invoke<EnvelopeSummary[]>("list_messages_for_contact", {
         contactId,
-        limit: 50,
+        limit: 5,
         offset: 0,
       });
       setMessages(m);
+      // Termine: 30 Tage zurück bis weit in die Zukunft. Frontend
+      // partitioniert in "Anstehend" (start_at >= now) und
+      // "Letzte 30 Tage" (sonst). Far-future-Bound = Jahr 9999, damit
+      // wirklich alle anstehenden Termine reinfallen — die Limit-
+      // Klausel im Backend hält die Query auch bei Power-Usern kurz.
+      const now = new Date();
+      const from = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000)
+        .toISOString();
+      const to = "9999-12-31T23:59:59Z";
+      try {
+        const ev = await invoke<Commitment[]>("cal_list_for_contact", {
+          contactId,
+          from,
+          to,
+          limit: 200,
+        });
+        setEvents(ev);
+      } catch (eEvents) {
+        // Calendar-Read-Fehler sollen die Mail-Liste nicht
+        // verstummen lassen — getrennter try/catch.
+        console.warn("cal_list_for_contact failed", eEvents);
+        setEvents([]);
+      }
     } catch (e) {
       setError(String(e));
     }
@@ -240,6 +282,25 @@ export function ContactDetail({
     });
   };
 
+  /** Termin planen mit diesem Kontakt. Wählt dieselbe Primary-Email
+   *  wie `composeMail` (für Konsistenz, wenn der Kontakt mehrere hat)
+   *  und delegiert das Folder-Switch + Editor-Öffnen an den Caller.
+   *  Wenn keine Email gespeichert ist, kann kein iMIP-Empfänger
+   *  abgeleitet werden — Hinweis-Fehler analog zu Mail-Pfad. */
+  const planMeeting = () => {
+    if (!detail) return;
+    const primary = detail.emails.find((e) => e.isPrimary) ?? detail.emails[0];
+    if (!primary) {
+      setError(t("contacts.noEmailToSendTo"));
+      return;
+    }
+    onPlanMeeting({
+      email: primary.email,
+      displayName: detail.displayName || null,
+      partstat: null,
+    });
+  };
+
   /** Manueller Re-Extract-Trigger für extracted-origin contacts mit
    *  neuerer Mail seit der letzten Extraktion. Greifen über
    *  list_messages, der dort vorhandene jüngste Eintrag wird als
@@ -302,6 +363,20 @@ export function ContactDetail({
               >
                 {t("contacts.composeMail")}
               </button>
+              {detail.emails.length > 0 && (
+                <button
+                  type="button"
+                  onClick={planMeeting}
+                  className="rounded-md border px-2 py-0.5 text-xs"
+                  style={{
+                    borderColor: "var(--border-base)",
+                    color: "var(--fg-base)",
+                  }}
+                  title={t("contacts.planMeetingHint")}
+                >
+                  {t("contacts.planMeeting")}
+                </button>
+              )}
               <button
                 type="button"
                 onClick={() => setEditing(true)}
@@ -456,7 +531,7 @@ export function ContactDetail({
             {messages.length > 0 && (
               <Section title={t("contacts.recentMessages")}>
                 <ul className="flex flex-col">
-                  {messages.slice(0, 20).map((m) => (
+                  {messages.slice(0, 5).map((m) => (
                     <li
                       key={m.id}
                       onClick={() => onOpenMessage(m.id)}
@@ -499,6 +574,11 @@ export function ContactDetail({
                 </ul>
               </Section>
             )}
+
+            <EventsSection
+              events={events}
+              onOpen={onOpenEvent}
+            />
           </>
         )}
       </div>
@@ -770,6 +850,141 @@ function ContactFormFields({
       </label>
     </div>
   );
+}
+
+/** Termine-Section. Renders two sub-buckets:
+ *  - "Anstehend" — events with start_at >= now, sorted ascending so the
+ *    next one is on top (calendar-like).
+ *  - "Letzte 30 Tage" — events with start_at < now, reverse-sorted so
+ *    the most recent one is on top.
+ *
+ *  The backend returns CONFIRMED + TENTATIVE rows already
+ *  pre-filtered, in start-ascending order. We partition here so the
+ *  two lists can stay collapsed/empty-pruned independently. */
+function EventsSection({
+  events,
+  onOpen,
+}: {
+  events: Commitment[];
+  onOpen: (commitmentId: string) => void;
+}) {
+  const { t } = useTranslation();
+  if (events.length === 0) return null;
+  const now = Date.now();
+  const upcoming: Commitment[] = [];
+  const past: Commitment[] = [];
+  for (const e of events) {
+    const start = Date.parse(e.startAt);
+    if (Number.isNaN(start)) continue;
+    if (start >= now) {
+      upcoming.push(e);
+    } else {
+      past.push(e);
+    }
+  }
+  // Past list reads most-recent-first — matches "letzte E-Mails"
+  // ordering.
+  past.reverse();
+
+  if (upcoming.length === 0 && past.length === 0) return null;
+
+  return (
+    <Section title={t("contacts.events.title")}>
+      {upcoming.length > 0 && (
+        <EventBucket
+          label={t("contacts.events.upcoming")}
+          events={upcoming}
+          onOpen={onOpen}
+        />
+      )}
+      {past.length > 0 && (
+        <EventBucket
+          label={t("contacts.events.past30")}
+          events={past}
+          onOpen={onOpen}
+          muted
+        />
+      )}
+    </Section>
+  );
+}
+
+function EventBucket({
+  label,
+  events,
+  onOpen,
+  muted = false,
+}: {
+  label: string;
+  events: Commitment[];
+  onOpen: (commitmentId: string) => void;
+  muted?: boolean;
+}) {
+  const { t } = useTranslation();
+  return (
+    <div className="mt-1 flex flex-col">
+      <div
+        className="mb-0.5 text-[10px] font-medium uppercase tracking-wider"
+        style={{ color: "var(--fg-muted)" }}
+      >
+        {label}
+      </div>
+      <ul
+        className="flex flex-col"
+        style={{ opacity: muted ? 0.7 : 1 }}
+      >
+        {events.map((e) => (
+          <li
+            key={e.id}
+            onClick={() => onOpen(e.id)}
+            className="flex cursor-pointer items-center justify-between gap-2 rounded px-2 py-1 text-xs transition-colors"
+            onMouseEnter={(ev) =>
+              (ev.currentTarget.style.background = "var(--bg-hover)")
+            }
+            onMouseLeave={(ev) =>
+              (ev.currentTarget.style.background = "transparent")
+            }
+            title={t("contacts.events.openTitle")}
+          >
+            <span
+              className="min-w-0 flex-1 truncate"
+              style={{ color: "var(--fg-base)" }}
+            >
+              {e.summary || t("contacts.events.untitled")}
+            </span>
+            <span
+              className="shrink-0"
+              style={{ color: "var(--fg-subtle)" }}
+            >
+              {formatEventDate(e.startAt)}
+            </span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+/** Format an event's start as a short, locale-aware label. All-day
+ *  detection uses the same heuristic as elsewhere — start is
+ *  midnight-local. We pick: today/tomorrow/yesterday word, otherwise a
+ *  short date; with the time appended when not all-day. */
+function formatEventDate(rfc: string): string {
+  const d = new Date(rfc);
+  if (Number.isNaN(d.getTime())) return rfc;
+  const isMidnight =
+    d.getHours() === 0 && d.getMinutes() === 0 && d.getSeconds() === 0;
+  const datePart = new Intl.DateTimeFormat(undefined, {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+  }).format(d);
+  if (isMidnight) return datePart;
+  const timePart = new Intl.DateTimeFormat(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(d);
+  return `${datePart}, ${timePart}`;
 }
 
 function Section({

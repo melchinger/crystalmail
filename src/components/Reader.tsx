@@ -11,6 +11,7 @@ import {
 } from "./WorkflowPromptDialog";
 import { WorkflowResultDialog } from "./WorkflowResultDialog";
 import { decodeImapFolderName } from "../utils/imapFolderName";
+import { localDateTimeToRfc3339 } from "../utils/calendarEvent";
 import { IcsInvitePanel } from "./IcsInvitePanel";
 import { NegotiationPanel } from "./NegotiationPanel";
 import {
@@ -37,6 +38,7 @@ import type {
   ComposeDraft,
   ContactLookup,
   EnvelopeDetail,
+  EventExtractionResult,
   ExtractionResult,
   FlagChanges,
   Flags,
@@ -72,6 +74,17 @@ type Props = {
   /** Klick auf das Person-Icon im Mail-Header → springt in die
    *  Kontakte-View und öffnet den Detail-Inspector. */
   onShowContact: (contactId: string) => void;
+  /** "Termin aus Mail anlegen" → App wechselt in den Kalender und
+   *  öffnet den EventEditor im create-mode mit dem pi-extrahierten
+   *  Draft vorbefüllt. Felder sind im EventEditor-Format
+   *  (datetime-local-Strings). */
+  onPlanEventFromMail: (seed: {
+    summary?: string;
+    location?: string;
+    description?: string;
+    startAt?: string;
+    endAt?: string;
+  }) => void;
 };
 
 export function Reader({
@@ -85,6 +98,7 @@ export function Reader({
   onMarkSpamRequest,
   onSpamCandidateRequest,
   onShowContact,
+  onPlanEventFromMail,
 }: Props) {
   const { t } = useTranslation();
   const [state, setState] = useState<
@@ -237,6 +251,7 @@ export function Reader({
       onMarkSpamRequest={onMarkSpamRequest}
       onSpamCandidateRequest={onSpamCandidateRequest}
       onShowContact={onShowContact}
+      onPlanEventFromMail={onPlanEventFromMail}
     />
   );
 }
@@ -385,6 +400,7 @@ function MessageView({
   onMarkSpamRequest,
   onSpamCandidateRequest,
   onShowContact,
+  onPlanEventFromMail,
 }: {
   detail: MessageDetail;
   accounts: AccountSummary[];
@@ -396,6 +412,13 @@ function MessageView({
   onMarkSpamRequest: (id: string) => void;
   onSpamCandidateRequest: (id: string) => void;
   onShowContact: (contactId: string) => void;
+  onPlanEventFromMail: (seed: {
+    summary?: string;
+    location?: string;
+    description?: string;
+    startAt?: string;
+    endAt?: string;
+  }) => void;
 }) {
   const { t } = useTranslation();
   const [showDetails, setShowDetails] = useState(false);
@@ -422,6 +445,11 @@ function MessageView({
   });
   const [extractingContact, setExtractingContact] = useState(false);
   const [extractionToast, setExtractionToast] = useState<string | null>(null);
+  // "Termin aus Mail" — paralleler Flow zur Kontakt-Extraktion. Wir
+  // teilen die `extractionToast`-Lane für Fehler-/Empty-Meldungen weil
+  // beide Pfade vom Header aus getriggert werden und das UI sonst zwei
+  // konkurrierende Banner produziert.
+  const [extractingEvent, setExtractingEvent] = useState(false);
   const env = detail.envelope;
   const account = accounts.find((a) => a.id === env.accountId);
 
@@ -510,6 +538,52 @@ function MessageView({
       setExtractionToast(t("contacts.extractFailed", { detail: String(e) }));
     } finally {
       setExtractingContact(false);
+    }
+  };
+
+  /** "Termin aus Mail anlegen": pi scannt die Mail, bei Erfolg
+   *  springt's in die Kalender-View und öffnet den EventEditor mit den
+   *  extrahierten Feldern vorbefüllt. Bei "nichts gefunden" oder
+   *  pi-Fehler bleibt der Reader sichtbar und zeigt eine Toast-
+   *  Meldung. Idempotent — der Backend-Call ist read-only (kein
+   *  persist), Klick auf den Button starten heißt einfach erneut pi
+   *  anzuwerfen mit derselben Mail. */
+  const onPlanEventClick = async () => {
+    if (extractingEvent) return;
+    setExtractingEvent(true);
+    setExtractionToast(null);
+    try {
+      const result = await invoke<EventExtractionResult>(
+        "cal_extract_from_message",
+        { messageId: env.id },
+      );
+      switch (result.kind) {
+        case "found":
+          // Frontend-Konvertierung der naiven Lokalzeit in RFC 3339
+          // mit System-Offset — gleiche Logik wie die EventEditor-
+          // datetime-local-Pfade. Backend liefert garantiert
+          // `YYYY-MM-DDTHH:MM` (siehe `looks_like_local_datetime`).
+          onPlanEventFromMail({
+            summary: result.draft.summary || undefined,
+            location: result.draft.location || undefined,
+            description: result.draft.description || undefined,
+            startAt: localDateTimeToRfc3339(result.draft.startLocal),
+            endAt: localDateTimeToRfc3339(result.draft.endLocal),
+          });
+          break;
+        case "empty":
+          setExtractionToast(t("events.extractEmpty"));
+          break;
+        case "not_applicable":
+          setExtractionToast(
+            t("events.extractNotApplicable", { reason: result.reason }),
+          );
+          break;
+      }
+    } catch (e) {
+      setExtractionToast(t("events.extractFailed", { detail: String(e) }));
+    } finally {
+      setExtractingEvent(false);
     }
   };
 
@@ -870,6 +944,25 @@ function MessageView({
                   : `+ ${t("contacts.extractFromMail")}`}
             </button>
           )}
+          {/* Spiegelpfad zu Kontakt-Extraktion: "Termin aus Mail"
+              triggert pi, holt einen Termin-Draft und springt in den
+              EventEditor. Self-Mail-Filter spielt hier keine Rolle —
+              du kannst auch in deinen eigenen "Notiz an mich"-Mails
+              Termine drinhaben. */}
+          <button
+            type="button"
+            onClick={() => void onPlanEventClick()}
+            disabled={extractingEvent}
+            className="shrink-0 rounded-md border px-2 py-1 text-[11px] disabled:opacity-50"
+            style={{
+              borderColor: "var(--border-base)",
+              color: "var(--fg-muted)",
+              background: "transparent",
+            }}
+            title={t("events.extractFromMailHint")}
+          >
+            {extractingEvent ? "…" : `+ ${t("events.extractFromMail")}`}
+          </button>
         </div>
         {extractionToast && (
           <div
