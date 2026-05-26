@@ -1,7 +1,14 @@
 name: CodeQL
 
 # Advanced setup for CodeQL Code Scanning. Replaces GitHub's default setup
-# because the default doesn't know how to build Tauri:
+# because the default doesn't know how to build Tauri.
+#
+# IMPORTANT: Before this workflow can land successfully on main, default
+# setup MUST be disabled in the repo (Settings → Code security → Code
+# scanning → Default setup → Disable). Otherwise the analyze step uploads
+# a SARIF that GitHub rejects with "CodeQL analyses from advanced
+# configurations cannot be processed when the default setup is enabled."
+#
 #   * Tauri's build script needs the frontend `dist/` to exist (it bakes the
 #     manifest + frontend hash into a generated context). Without `npm run
 #     build` running first, `tauri::generate_context!()` errors out and the
@@ -46,8 +53,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Rust extractor only supports build-mode: none (verified against
+          # CodeQL 2.25.5 — `manual` is rejected at `init` with a fatal
+          # error). The extractor runs cargo itself; we just have to make
+          # sure the build environment it inherits is complete: Tauri
+          # Linux deps installed, frontend dist/ pre-built so tauri-build
+          # is happy when CodeQL's cargo invocation hits it.
           - language: rust
-            build-mode: manual
+            build-mode: none
           - language: javascript-typescript
             build-mode: none
 
@@ -98,15 +111,12 @@ jobs:
       # ensures the build pipeline is exercised end-to-end on every PR.
       - run: npm run build
 
-      - if: matrix.language == 'rust'
-        name: Cargo build (src-tauri)
-        working-directory: src-tauri
-        # `build`, not `check`: the CodeQL Rust extractor wants the full
-        # codegen path exercised so every macro expansion lands in the
-        # database, not just the type-checker view. rust-cache above keeps
-        # warm runs fast (~2 min) even though the first cold run costs
-        # ~10 min for the sqlcipher-vendored-openssl build.
-        run: cargo build --all-targets
+      # No explicit `cargo build` step. With build-mode: none the CodeQL
+      # Rust extractor invokes cargo itself between `init` and `analyze`
+      # — running our own cargo here would just duplicate the work and
+      # the cache slot would race with the extractor's. The Tauri deps
+      # + npm build above are still required because the extractor's
+      # internal cargo invocation inherits this environment.
 
       - uses: github/codeql-action/analyze@v3
         with:
