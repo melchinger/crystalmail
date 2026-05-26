@@ -2025,29 +2025,21 @@ function buildSandboxDoc(
     ? "data: https: http:"
     : "data:";
   const csp = `default-src 'none'; img-src ${imgSrc}; style-src 'unsafe-inline'; script-src 'unsafe-inline'; font-src data:;`;
-  return `<!DOCTYPE html>
-<html>
-  <head>
-    <meta charset="utf-8" />
-    <meta name="color-scheme" content="light dark" />
-    <meta http-equiv="Content-Security-Policy" content="${csp}" />
-    <style>
-      :root { color-scheme: light dark; }
-      html, body {
-        margin: 0;
-        padding: 1rem 1.25rem;
-        font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-        color: #1f2937;
-        background: #ffffff;
-      }
-      /* Dark-Mode-Body: pure white Text auf near-black. Vorher off-white
-         (#e5e7eb), das auf groesseren Mail-Body-Flaechen gegen das
-         near-black subjektiv matt wirkte. !important zieht inline
-         color:#1f2937 (typisch von Outlook/Apple-Mail-erzeugten Body-
-         Wrappern) auf lesbare Helligkeit hoch; Inline-Tags innerhalb
-         von Spans/Divs mit tatsaechlich gewollter Faerbung bleiben
-         unangetastet (CSS-Specificity: html/body !important schlaegt
-         nur das top-level Body, nicht die der inneren Elemente). */
+  // Dark-Mode-Politik fuer die iframe-Buehne:
+  //   * Plain-Text-Mails: respect prefers-color-scheme. Keine Autoren-CSS
+  //     im Spiel, also schalten wir Body-Farben mit der OS-Praeferenz um.
+  //   * HTML-Mails: IMMER hellen Hintergrund + dunkle Default-Schrift.
+  //     HTML-Mails sind in der Praxis durch die Bank fuer Light-Mode
+  //     designt (Newsletter, Marketing, Transaktional). Setzen wir dort
+  //     einen dunklen Body, kollidiert er regelmaessig mit autorseits
+  //     gesetzten Farbtoenen (mittelgrauer Text auf weisser Kachel des
+  //     Senders → wirkt im Dark-Wrapper als low-contrast-Text auf dunklem
+  //     Rand). Apple Mail / Thunderbird machen es identisch.
+  //   Die App-Chrome um das iframe herum bleibt in beiden Faellen dunkel —
+  //   die Helligkeitsspruenge sind im Bild gewollt: Mail-Buehne = Papier.
+  const colorScheme = preformatted ? "light dark" : "light only";
+  const darkModeBlock = preformatted
+    ? `
       @media (prefers-color-scheme: dark) {
         html, body {
           color: #ffffff !important;
@@ -2055,7 +2047,23 @@ function buildSandboxDoc(
         }
         blockquote { border-left-color: #4b5563 !important; color: #d1d5db !important; }
         a { color: #93c5fd !important; }
-      }
+      }`
+    : "";
+  return `<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="color-scheme" content="${colorScheme}" />
+    <meta http-equiv="Content-Security-Policy" content="${csp}" />
+    <style>
+      :root { color-scheme: ${colorScheme}; }
+      html, body {
+        margin: 0;
+        padding: 1rem 1.25rem;
+        font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        color: #1f2937;
+        background: #ffffff;
+      }${darkModeBlock}
       a { color: #2563eb; cursor: pointer; }
       img { max-width: 100%; height: auto; }
       table { max-width: 100%; }
