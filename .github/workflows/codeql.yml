@@ -1,0 +1,123 @@
+name: CodeQL
+
+# Advanced setup for CodeQL Code Scanning. Replaces GitHub's default setup
+# because the default doesn't know how to build Tauri.
+#
+# IMPORTANT: Before this workflow can land successfully on main, default
+# setup MUST be disabled in the repo (Settings → Code security → Code
+# scanning → Default setup → Disable). Otherwise the analyze step uploads
+# a SARIF that GitHub rejects with "CodeQL analyses from advanced
+# configurations cannot be processed when the default setup is enabled."
+#
+#   * Tauri's build script needs the frontend `dist/` to exist (it bakes the
+#     manifest + frontend hash into a generated context). Without `npm run
+#     build` running first, `tauri::generate_context!()` errors out and the
+#     dependency macro tree never expands.
+#   * Tauri on Linux pulls webkit2gtk / appindicator headers via pkg-config.
+#     Default scanning runs on a vanilla runner and these headers are
+#     missing, so half the dependency graph fails to type-check.
+#   * #[tauri::command] + generate_handler! generate the entire frontend↔
+#     backend dispatcher table. Without macro expansion CodeQL sees the
+#     attribute but not the resulting call edges → "Percentage of calls
+#     with call target" plummets and the Rust DB ends up under-resolved.
+#
+# To switch from default to this workflow: Repo Settings → Code security →
+# Code scanning → Default setup → Switch to advanced. Then disable the
+# default-setup scan; otherwise both run and rack up two sets of findings.
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  schedule:
+    # Weekly background scan so a CVE in a transitive dep gets noticed even
+    # if no one pushes for a while. Mondays 06:00 UTC = early Europe morning.
+    - cron: "0 6 * * 1"
+
+# Least-privilege token. `security-events: write` is the only privilege the
+# CodeQL action actually needs to upload SARIF. `actions: read` lets it
+# read workflow metadata for the run summary; `contents: read` is the
+# implicit baseline for checkout.
+permissions:
+  security-events: write
+  actions: read
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Rust extractor only supports build-mode: none (verified against
+          # CodeQL 2.25.5 — `manual` is rejected at `init` with a fatal
+          # error). The extractor runs cargo itself; we just have to make
+          # sure the build environment it inherits is complete: Tauri
+          # Linux deps installed, frontend dist/ pre-built so tauri-build
+          # is happy when CodeQL's cargo invocation hits it.
+          - language: rust
+            build-mode: none
+          - language: javascript-typescript
+            build-mode: none
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Node is needed even for the Rust job — `cargo check` on src-tauri
+      # invokes tauri-build, which requires the frontend dist/ to exist.
+      # We run `npm ci && npm run build` below for both jobs; for the
+      # JS/TS job that doubles as ensuring node_modules is in place for
+      # any AST-level inferences the extractor wants to make.
+      - uses: actions/setup-node@v4
+        with: { node-version: "20" }
+
+      - if: matrix.language == 'rust'
+        uses: dtolnay/rust-toolchain@stable
+
+      - if: matrix.language == 'rust'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri -> target"
+          # Different cache slot per OS+language so the regular CI run on
+          # ubuntu-latest doesn't poison the CodeQL build cache or vice
+          # versa (CodeQL injects an extractor wrapper around rustc).
+          key: codeql-rust
+
+      - if: matrix.language == 'rust'
+        name: Install Tauri Linux deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
+      # CodeQL init must run BEFORE the build so it can wrap rustc and
+      # intercept every compilation unit. Skipping this ordering is the
+      # #1 cause of "low analysis quality" warnings on Rust projects.
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+
+      - run: npm ci
+
+      # Frontend build — needed for the Rust job because tauri-build reads
+      # dist/. For the JS/TS job it's a no-op for analysis quality but
+      # ensures the build pipeline is exercised end-to-end on every PR.
+      - run: npm run build
+
+      # No explicit `cargo build` step. With build-mode: none the CodeQL
+      # Rust extractor invokes cargo itself between `init` and `analyze`
+      # — running our own cargo here would just duplicate the work and
+      # the cache slot would race with the extractor's. The Tauri deps
+      # + npm build above are still required because the extractor's
+      # internal cargo invocation inherits this environment.
+
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
