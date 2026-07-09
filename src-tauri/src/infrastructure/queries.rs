@@ -883,8 +883,6 @@ pub fn search_advanced(
 
     // FTS branch joins on rowid; non-FTS branch goes directly against
     // `envelopes`. Folder branch needs a `folders` JOIN either way.
-    // Order-by differs: FTS branch ranks by bm25, non-FTS goes by date
-    // (descending — newest first matches list-view convention).
     let join_folders = folder_clause.is_some();
     let from_clause = if use_fts {
         if join_folders {
@@ -905,11 +903,12 @@ pub fn search_advanced(
         "envelopes e
           JOIN accounts a ON a.id = e.account_id"
     };
-    let order_by = if use_fts {
-        "bm25(fts_envelopes)"
-    } else {
-        "e.date_utc DESC"
-    };
+    // Always sort newest-first by date, FTS or not. Users scanning
+    // search results expect the same chronological order as the inbox
+    // list (most recent on top) rather than an opaque bm25 relevance
+    // ranking — a mail from this morning shouldn't sink below a more
+    // "relevant" one from two years ago.
+    let order_by = "e.date_utc DESC";
 
     let where_sql = where_parts.join(" AND ");
     let sql = format!(

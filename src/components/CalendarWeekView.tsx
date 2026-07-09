@@ -47,6 +47,8 @@ type Props = {
    *  bars per source calendar. Empty map is fine — events without a
    *  subscriptionId fall back to the accent color. */
   subscriptionsById: ReadonlyMap<string, SubInfo>;
+  /** Color for local (non-subscription) events. `undefined` ⇒ accent. */
+  localColor?: string;
   onPickEvent: (id: string) => void;
   /** Click on empty space inside a day column. The Date carries the
    *  resolved start time (rounded down to a 30-min slot). The parent
@@ -77,6 +79,7 @@ export function CalendarWeekView({
   anchorDate,
   events,
   subscriptionsById,
+  localColor,
   onPickEvent,
   onCreateAt,
 }: Props) {
@@ -209,7 +212,7 @@ export function CalendarWeekView({
                 gridColumnStart: bar.startCol + 2,
                 gridColumnEnd: `span ${bar.spanCols}`,
                 gridRowStart: rowIdx + 1,
-                background: eventColor(bar.commitment, subscriptionsById),
+                background: eventColor(bar.commitment, subscriptionsById, localColor),
                 color: "#fff",
                 border: "1px solid rgba(0,0,0,0.1)",
               }}
@@ -258,6 +261,7 @@ export function CalendarWeekView({
             day={day}
             events={weekEvents}
             subscriptionsById={subscriptionsById}
+            localColor={localColor}
             onPickEvent={onPickEvent}
             onCreateAt={onCreateAt}
           />
@@ -271,12 +275,14 @@ function DayColumn({
   day,
   events,
   subscriptionsById,
+  localColor,
   onPickEvent,
   onCreateAt,
 }: {
   day: Date;
   events: Commitment[];
   subscriptionsById: ReadonlyMap<string, SubInfo>;
+  localColor?: string;
   onPickEvent: (id: string) => void;
   onCreateAt: (start: Date) => void;
 }) {
@@ -313,9 +319,19 @@ function DayColumn({
         startsAt: new Date(s),
         endsAt: new Date(en),
         durMin,
+        // Visible-window-clamped bounds drive the side-by-side overlap
+        // layout below — two bars share a column-cluster iff their drawn
+        // rectangles overlap.
+        visStartMs: visiblyClampedStart,
+        visEndMs: visiblyClampedEnd,
       };
     })
     .filter((x): x is NonNullable<typeof x> => x !== null);
+
+  // Resolve overlaps: events whose drawn rectangles intersect are packed
+  // into adjacent equal-width columns instead of stacking on top of each
+  // other. `colByEvent` maps each event id → { col, cols } for its cluster.
+  const colByEvent = packColumns(dayEvents);
 
   const today = startOfDay(new Date());
   const isToday = dayStart.getTime() === today.getTime();
@@ -373,7 +389,13 @@ function DayColumn({
           startsAt,
           endsAt,
           durMin,
-        }) => (
+        }) => {
+          // Side-by-side slot within the overlap cluster. `cols === 1`
+          // (the common case) ⇒ full-width bar, identical to before.
+          const slot = colByEvent.get(commitment.id) ?? { col: 0, cols: 1 };
+          const widthPct = 100 / slot.cols;
+          const leftPct = slot.col * widthPct;
+          return (
           <button
             key={commitment.id}
             type="button"
@@ -381,12 +403,16 @@ function DayColumn({
               e.stopPropagation();
               onPickEvent(commitment.id);
             }}
-            className="absolute left-0.5 right-0.5 overflow-hidden rounded px-1.5 py-1 text-left text-xs leading-tight transition hover:opacity-80"
+            className="absolute overflow-hidden rounded px-1.5 py-1 text-left text-xs leading-tight transition hover:opacity-80"
             style={{
               top: `${topPct}%`,
               height: `${heightPct}%`,
+              // 1px edge inset + 2px gaps between adjacent columns so
+              // neighbouring bars stay visually distinct.
+              left: `calc(${leftPct}% + 1px)`,
+              width: `calc(${widthPct}% - 2px)`,
               minHeight: "20px",
-              background: eventColor(commitment, subscriptionsById),
+              background: eventColor(commitment, subscriptionsById, localColor),
               color: "#fff",
               border: "1px solid rgba(0,0,0,0.1)",
             }}
@@ -404,13 +430,91 @@ function DayColumn({
             )}
             {overflowsBottom && <span> ↓</span>}
           </button>
-        ),
+          );
+        },
       )}
     </div>
   );
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────
+
+/**
+ * Resolve overlapping timed events into side-by-side columns.
+ *
+ * Events are first grouped into *clusters* — maximal runs where each
+ * event's drawn rectangle transitively touches the next. Within a
+ * cluster, a greedy first-fit assigns every event to the leftmost
+ * column whose previous occupant has already ended; the number of
+ * columns used is the cluster's peak simultaneity. All events in a
+ * cluster report that same `cols`, so the caller renders equal-width
+ * bars (`100 / cols`%) offset by `col`.
+ *
+ * Events that never overlap anyone stay in a one-column cluster and
+ * thus keep full width — the layout only narrows bars where it has to.
+ */
+function packColumns(
+  items: ReadonlyArray<{
+    commitment: { id: string };
+    visStartMs: number;
+    visEndMs: number;
+  }>,
+): Map<string, { col: number; cols: number }> {
+  const out = new Map<string, { col: number; cols: number }>();
+  if (items.length === 0) return out;
+
+  // Sort by start asc, then by end desc so longer bars take a column first.
+  const sorted = [...items].sort(
+    (a, b) => a.visStartMs - b.visStartMs || b.visEndMs - a.visEndMs,
+  );
+
+  let cluster: typeof sorted = [];
+  let clusterEnd = -Infinity;
+
+  const flush = () => {
+    if (cluster.length === 0) return;
+    // colEnd[c] = end time of the last event placed in column c.
+    const colEnd: number[] = [];
+    const colOf = new Map<string, number>();
+    for (const ev of cluster) {
+      let placed = -1;
+      for (let c = 0; c < colEnd.length; c++) {
+        if (ev.visStartMs >= colEnd[c]) {
+          placed = c;
+          break;
+        }
+      }
+      if (placed === -1) {
+        placed = colEnd.length;
+        colEnd.push(ev.visEndMs);
+      } else {
+        colEnd[placed] = ev.visEndMs;
+      }
+      colOf.set(ev.commitment.id, placed);
+    }
+    const cols = colEnd.length;
+    for (const ev of cluster) {
+      out.set(ev.commitment.id, {
+        col: colOf.get(ev.commitment.id) ?? 0,
+        cols,
+      });
+    }
+  };
+
+  for (const ev of sorted) {
+    // A start at-or-after the cluster's running end means it touches
+    // nobody so far → close the current cluster and open a new one.
+    if (cluster.length > 0 && ev.visStartMs >= clusterEnd) {
+      flush();
+      cluster = [];
+      clusterEnd = -Infinity;
+    }
+    cluster.push(ev);
+    clusterEnd = Math.max(clusterEnd, ev.visEndMs);
+  }
+  flush();
+  return out;
+}
 
 /** Convert "minutes since 00:00" → percentage of the visible window
  *  (0% = top of the visible grid, 100% = bottom). Used for both the

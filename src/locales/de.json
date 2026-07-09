@@ -725,6 +725,8 @@
       "description": "Synchronisiert deinen lokalen Kalender mit einem versteckten IMAP-Folder, sodass mehrere CrystalMail-Geräte und ein optionaler timeBank-Delegat denselben Stand sehen. Format folgt timeProtocol ADR-0011 (METHOD:PUBLISH, append-only, SEQUENCE-Versionierung). Aus = lokaler Modus (Phase 1), kein Mail-Verkehr.",
       "loading": "Lädt …",
       "enabled": "IMAP-Sync aktivieren",
+      "localColor": "Farbe des Standard-Kalenders",
+      "localColorHint": "Tönt eigene Termine (manuell, aus Mails importiert). Klick: nächste Palette-Farbe · Rechts-/Umschalt-Klick: freie Farbe.",
       "account": "Kalender-Account",
       "accountNone": "(noch nicht gewählt)",
       "folder": "IMAP-Folder-Pfad",

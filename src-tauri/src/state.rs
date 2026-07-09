@@ -163,10 +163,21 @@ pub struct CalendarConfig {
     /// state correctly.
     #[serde(default = "default_compaction_enabled")]
     pub compaction_enabled: bool,
+    /// Hex color (`#rrggbb`) used to tint the local/standard calendar's
+    /// events — everything that isn't owned by an iCal subscription
+    /// (manually created, ICS-imported, negotiation). Lets the user
+    /// distinguish their own entries from subscribed feeds, mirroring the
+    /// per-subscription color. Default is the palette's first blue.
+    #[serde(default = "default_local_color")]
+    pub color: String,
 }
 
 fn default_folder_path() -> String {
     "INBOX/TimeProtocol/Calendar".to_string()
+}
+
+fn default_local_color() -> String {
+    "#3b82f6".to_string()
 }
 
 fn default_auto_sync_interval() -> u64 {
@@ -195,6 +206,7 @@ impl Default for CalendarConfig {
             idle_enabled: default_idle_enabled(),
             sync_on_mutation: default_sync_on_mutation(),
             compaction_enabled: default_compaction_enabled(),
+            color: default_local_color(),
         }
     }
 }

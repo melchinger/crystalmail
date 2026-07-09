@@ -15,6 +15,10 @@
 //   "phrase"            — bare phrase, passed to FTS5 verbatim
 //   -word               — FTS5 negation, passed through
 //   bare-word           — FTS5 free text
+//   tdsynnex.com        — dotted domains & e-mail addresses are wrapped
+//   john@tdsynnex.com     as FTS5 phrases so the `.`/`@` (which the
+//                         tokenizer treats as separators) don't split
+//                         them into unrelated barewords
 //   today | yesterday | last week | this week | this month | this year
 //                       — relative time phrases, parsed without prefix
 //
@@ -489,9 +493,10 @@ export function parseSearchQuery(input: string): ParsedQuery {
       continue;
     }
 
-    // Plain word / quoted phrase / negation — pass through. FTS5
-    // handles `"phrase"` and `-word` natively, so no extra escaping.
-    ftsParts.push(tok);
+    // Plain word / quoted phrase / negation. FTS5 handles `"phrase"`
+    // and `-word` natively; `ftsFreeToken` additionally phrase-wraps
+    // dotted domains / e-mail addresses so they survive tokenisation.
+    ftsParts.push(ftsFreeToken(tok));
   }
 
   return {
@@ -521,11 +526,38 @@ function firstUnquotedColon(s: string): number {
 }
 
 /** Wrap a value in double quotes for FTS5 if it contains anything
- *  FTS5 might interpret (whitespace, special chars). Already-quoted
- *  values pass through. */
+ *  FTS5 might interpret (whitespace, special chars) — including the
+ *  `.`/`@` of domains and e-mail addresses, which the tokenizer would
+ *  otherwise split. Already-quoted values pass through. */
 function quoteForFts(s: string): string {
   if (!s) return "";
   if (s.startsWith('"') && s.endsWith('"')) return s;
-  if (/[\s"():*-]/.test(s)) return `"${s.replace(/"/g, "")}"`;
+  if (/[\s"():*.@-]/.test(s)) return `"${s.replace(/"/g, "")}"`;
   return s;
+}
+
+/**
+ * Prepare a bare free-text token for the FTS5 query.
+ *
+ * Domain names and e-mail addresses (`tdsynnex.com`,
+ * `john@tdsynnex.com`) contain `.` and `@`, which FTS5's tokenizer
+ * treats as separators. An unquoted `tdsynnex.com` therefore parses as
+ * the two independent barewords `tdsynnex` and `com`, so the search
+ * matches any mail that merely mentions "com". Wrapping the token in
+ * double quotes turns it into an FTS5 phrase: the tokens must appear
+ * adjacently, so `…@tdsynnex.com` matches while a stray "com" doesn't.
+ *
+ * Already-quoted tokens and plain words (no `.`/`@`) pass through
+ * untouched; a leading `-` (FTS negation) is preserved outside the
+ * quotes.
+ */
+function ftsFreeToken(tok: string): string {
+  if (tok.startsWith('"')) return tok; // already a phrase
+  const neg = tok.startsWith("-") ? "-" : "";
+  const body = neg ? tok.slice(1) : tok;
+  if (!body) return tok;
+  if (/[.@]/.test(body)) {
+    return `${neg}"${body.replace(/"/g, "")}"`;
+  }
+  return tok;
 }

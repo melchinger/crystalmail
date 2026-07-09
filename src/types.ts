@@ -634,6 +634,10 @@ export type CalendarConfig = {
   /** Run a compaction pass after every successful sync that moves
    *  superseded ICS messages into `<folder>/Archive`. Default true. */
   compactionEnabled: boolean;
+  /** Hex color (`#rrggbb`) for the local/standard calendar's events —
+   *  everything not owned by an iCal subscription. Mirrors a
+   *  subscription's `color`. */
+  color: string;
 };
 
 /** Result of `cal_sync_imap`. Surfaced to the UI so the sync button can

@@ -1388,6 +1388,18 @@ export function App() {
       rows: EnvelopeSummary[];
       searchError: string | null;
     } | null> => {
+      // Calendar/Contacts are client-side-derived pseudo-views with no
+      // IMAP folder behind them. Bail out before touching the backend:
+      // returning null tells `refresh` to keep the current mail list in
+      // state (there's nothing to fetch here) and — crucially — avoids
+      // handing the pseudo-key to `list_unified_folder`/`search_advanced`,
+      // which reject it with "unknown folder key: calendar". This path is
+      // hit whenever a sync/refresh fires while the calendar view is open
+      // — e.g. right after "Termin aus Mail anlegen" switches the view.
+      if (activeFolder === "calendar" || activeFolder === "contacts") {
+        return null;
+      }
+
       const folderKey = activeFolder === "unified" ? "inbox" : activeFolder;
       try {
         // Ad-hoc sub-folder pinned: search and listing both go through
@@ -1658,6 +1670,10 @@ export function App() {
     // chronological window. Pulling older from IMAP wouldn't add to
     // the visible result set without re-running FTS.
     if (searchQuery.length > 0) return;
+    // Non-mail pseudo-views have no IMAP folder to page — skip entirely
+    // so phase 2 never hands "calendar"/"contacts" to
+    // `sync_unified_folder_older` (→ "unknown folder key").
+    if (activeFolder === "calendar" || activeFolder === "contacts") return;
     if (exhaustedRef.current === viewKey) return;
     loadingOlderRef.current = true;
     void (async () => {
@@ -1802,13 +1818,29 @@ export function App() {
           return null;
       }
     };
+    // Account-filter active ⇒ sync only that account. The manual sync
+    // then mirrors what the user is actually looking at instead of
+    // fanning out across every configured account.
+    const targets = accountFilter
+      ? accounts.filter((a) => a.id === accountFilter)
+      : accounts;
+
+    // Folder-scoped sync: when filtered to one account *and* sitting in
+    // a concrete server folder (Sent, Archive, …), pull just that
+    // folder and stop — don't drag the account's other specials along.
+    // The unified inbox stays a full-account sync, since INBOX is the
+    // primary view people expect a complete refresh in.
+    const FOLDER_SCOPED_VIEWS = ["sent", "archive", "drafts", "trash", "spam"];
+    const onlyPriority =
+      accountFilter !== null && FOLDER_SCOPED_VIEWS.includes(activeFolder);
     try {
-      for (const a of accounts) {
+      for (const a of targets) {
         setStatus(t("sync.perAccount", { name: a.displayName }));
         try {
           const r = await invoke<SyncReport>("sync_account", {
             accountId: a.id,
             priorityFolder: priorityFor(a),
+            onlyPriority,
           });
           total += r.stored;
           totalMs += r.durationMs;
@@ -1827,7 +1859,7 @@ export function App() {
       setSyncing(false);
       syncInFlight.current = false;
     }
-  }, [accounts, activeFolder, t, refresh]);
+  }, [accounts, accountFilter, activeFolder, t, refresh]);
 
   // Keep the ref pointing at the latest syncAll so the hotkey hook (which
   // captured callbacks on mount) can always invoke the current version.

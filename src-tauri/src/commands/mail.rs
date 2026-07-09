@@ -155,6 +155,7 @@ pub async fn sync_account(
     app: AppHandle,
     account_id: AccountId,
     priority_folder: Option<String>,
+    only_priority: Option<bool>,
 ) -> Result<SyncReport, String> {
     let state = app.state::<AppState>();
     let db = state.db.get().ok_or("database not ready")?;
@@ -168,6 +169,14 @@ pub async fn sync_account(
     if let Some(name) = priority_folder {
         let priority_report =
             sync::sync_single_folder(&app, db, account_id, &name).await?;
+
+        // `only_priority` scopes a manual sync to exactly the folder the
+        // user is looking at (e.g. account-filtered + sitting in Sent):
+        // sync that one folder and stop, no background walk of the
+        // remaining specials and no prefetch.
+        if only_priority.unwrap_or(false) {
+            return Ok(priority_report);
+        }
 
         let app2 = app.clone();
         let skip = vec![name];

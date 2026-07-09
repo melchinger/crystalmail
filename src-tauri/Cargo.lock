@@ -795,7 +795,7 @@ dependencies = [
 
 [[package]]
 name = "crystalmail"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "argon2",

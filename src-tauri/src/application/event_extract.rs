@@ -62,6 +62,16 @@ Eingabe-Body: `... am kommenden Dienstag um 19 Uhr ... ZOOM-Raum: https://zoom.u
 Erwartete Ausgabe: {"found":true,"summary":"Video-Regio-Austausch","start_local":"2026-05-19T19:00","end_local":"2026-05-19T20:00","location":"https://zoom.us/j/88660338369","description":"Netzwerk-Team Südwest, monatlicher Austausch."}
 "#;
 
+/// Nachfass-Suffix für den zweiten Versuch, wenn der erste keine
+/// verwertbare JSON-Antwort lieferte (kleinere Modelle schreiben gern
+/// Prosa statt des geforderten Objekts). pi bietet keinen JSON-Mode und
+/// kein Prefill (siehe pi RPC-Docs — `prompt` kennt nur `message`), also
+/// ist ein strikterer Re-Prompt der einzige Hebel auf unserer Seite.
+const RETRY_SUFFIX: &str = "ACHTUNG: Deine letzte Antwort war ungültig \
+(Fließtext statt JSON). Gib JETZT AUSSCHLIESSLICH das JSON-Objekt zurück — \
+keine Erklärung, kein Markdown, keine Aufzählung. Dein erstes Zeichen muss `{` \
+sein, dein letztes `}`.";
+
 /// Datum/Uhrzeit-Format für den Frontend-Editor — exakt das, was ein
 /// HTML5 `datetime-local`-Input liefern würde.
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -102,10 +112,36 @@ struct RawPiOutput {
     found: Option<serde_json::Value>,
     #[serde(default, deserialize_with = "null_to_empty")]
     summary: String,
-    #[serde(default, deserialize_with = "null_to_empty")]
+    // Kleinere Modelle ignorieren das `*_local`-Schema reproduzierbar und
+    // liefern stattdessen `start`/`end` (oft nur Datum) oder ein separates
+    // `date` + `start_time`/`end_time`. Wir nehmen alle drei Formen an und
+    // rekonstruieren daraus in `resolve_datetime` eine `YYYY-MM-DDTHH:MM`.
+    #[serde(
+        default,
+        alias = "start",
+        alias = "start_at",
+        alias = "start_datetime",
+        alias = "begin",
+        deserialize_with = "null_to_empty"
+    )]
     start_local: String,
-    #[serde(default, deserialize_with = "null_to_empty")]
+    #[serde(
+        default,
+        alias = "end",
+        alias = "end_at",
+        alias = "end_datetime",
+        alias = "finish",
+        deserialize_with = "null_to_empty"
+    )]
     end_local: String,
+    /// Separates Datum-Feld (`"2026-07-23"`) — kombiniert mit `start_time`/
+    /// `end_time`, wenn das Modell Datum und Zeit getrennt ausgibt.
+    #[serde(default, deserialize_with = "null_to_empty")]
+    date: String,
+    #[serde(default, deserialize_with = "null_to_empty")]
+    start_time: String,
+    #[serde(default, deserialize_with = "null_to_empty")]
+    end_time: String,
     #[serde(default, deserialize_with = "null_to_empty")]
     location: String,
     #[serde(default, deserialize_with = "null_to_empty")]
@@ -192,35 +228,72 @@ pub async fn extract_event_for_message(
          --- END E-MAIL ---\n\
          \n\
          Reminder: Der BETREFF oben ist Teil der Mail. Wenn das Datum/Uhrzeit \
-         dort steht (auch wenn der Body nichts dazu sagt), trotzdem extrahieren.",
+         dort steht (auch wenn der Body nichts dazu sagt), trotzdem extrahieren.\n\
+         \n\
+         Fülle NUR diese Vorlage aus und ersetze die <…>-Platzhalter. Antworte \
+         AUSSCHLIESSLICH mit dem JSON-Objekt — kein Fließtext, kein Markdown. \
+         Beginne mit `{{` und ende mit `}}`:\n\
+         {{\"found\":<true|false>,\"summary\":\"<titel>\",\"start_local\":\"<YYYY-MM-DDTHH:MM>\",\"end_local\":\"<YYYY-MM-DDTHH:MM>\",\"location\":\"<ort-oder-url>\",\"description\":\"<kurz>\"}}",
         EXTRACT_PROMPT, mail_date_iso, subject, body_for_pi
     );
 
-    let json_text =
-        crate::application::contact_extract::call_pi(&app, prompt, PI_TIMEOUT_SECS).await?;
+    // ── 4. Pi rufen + parsen, mit einem strikteren Retry ─────────
+    //
+    // Kleinere Modelle antworten reproduzierbar mal mit reiner Prosa
+    // ("**Meeting Summary:** …") statt des JSON-Objekts. pi hat keinen
+    // JSON-Mode und kein Prefill (RPC-`prompt` kennt nur `message`), also
+    // ist der einzige Hebel: ein zweiter Versuch mit `RETRY_SUFFIX`. Bleibt
+    // auch der zweite ohne verwertbares JSON, ist das kein struktureller
+    // Fehler (roter Toast), sondern schlicht "nichts erkannt" → `Empty`.
+    let mut raw: Option<RawPiOutput> = None;
+    for attempt in 0..2u8 {
+        let this_prompt = if attempt == 0 {
+            prompt.clone()
+        } else {
+            format!("{prompt}\n\n{RETRY_SUFFIX}")
+        };
+        let json_text =
+            crate::application::contact_extract::call_pi(&app, this_prompt, PI_TIMEOUT_SECS)
+                .await?;
 
-    // Pi-Rohantwort loggen — bei "empty"/"not_applicable"-Toasts kann
-    // der User damit nachvollziehen, was das Modell tatsächlich
-    // geliefert hat (häufig: korrektes Datum aber in falschem Format).
-    // tracing::info gegen `RUST_LOG=info` (oder via Logger-Settings)
-    // sichtbar.
-    tracing::info!(
-        target: "event_extract",
-        raw_len = json_text.len(),
-        raw = %json_text.trim(),
-        "pi raw output"
-    );
+        // Pi-Rohantwort loggen — bei "empty"-Toasts kann der User damit
+        // nachvollziehen, was das Modell tatsächlich lieferte (häufig:
+        // korrektes Datum in falschem Format, oder eben Prosa).
+        tracing::info!(
+            target: "event_extract",
+            attempt,
+            raw_len = json_text.len(),
+            raw = %json_text.trim(),
+            "pi raw output"
+        );
 
-    // ── 4. Parse ─────────────────────────────────────────────────
-    let json_str = crate::application::contact_extract::first_balanced_object(&json_text)
-        .ok_or_else(|| {
-            format!(
-                "pi-Antwort enthält kein JSON-Objekt:\n---\n{}\n---",
-                json_text.trim()
-            )
-        })?;
-    let raw: RawPiOutput = serde_json::from_str(&json_str)
-        .map_err(|e| format!("pi-JSON nicht parsebar: {e}\n{json_str}"))?;
+        match crate::application::contact_extract::first_balanced_object(&json_text) {
+            Some(json_str) => match serde_json::from_str::<RawPiOutput>(&json_str) {
+                Ok(parsed) => {
+                    raw = Some(parsed);
+                    break;
+                }
+                Err(e) => tracing::info!(
+                    target: "event_extract",
+                    attempt,
+                    error = %e,
+                    "pi-JSON nicht parsebar — retry falls Versuche übrig"
+                ),
+            },
+            None => tracing::info!(
+                target: "event_extract",
+                attempt,
+                "pi lieferte kein JSON-Objekt (Prosa?) — retry falls Versuche übrig"
+            ),
+        }
+    }
+
+    // Kein verwertbares JSON nach beiden Versuchen: sauber als "nichts
+    // gefunden" behandeln statt den rohen Text als Fehler durchzureichen.
+    let raw = match raw {
+        Some(r) => r,
+        None => return Ok(EventExtractionResult::Empty),
+    };
 
     // `found`-Flag tolerieren — pi-Modelle liefern mal `true`/`false`,
     // mal `"true"`, mal das Feld gar nicht.
@@ -242,15 +315,21 @@ pub async fn extract_event_for_message(
     // Sonst: ein Termin gilt nur dann als gefunden, wenn mindestens
     // Start UND Ende normalisierbar sind. Ein nackter Titel ohne
     // Zeitanker hilft niemandem im Kalender.
-    let start = normalize_local_datetime(&raw.start_local);
-    let end_raw = raw.end_local.trim();
-    let end = if end_raw.is_empty() {
+    let start = resolve_datetime(&raw.start_local, &raw.date, &raw.start_time, "09:00");
+    // Ein Ende gilt nur dann als explizit genannt, wenn ein End-Datetime-
+    // ODER ein End-Zeit-Feld gefüllt ist. Ein bloßes `date` (das mit dem
+    // Start geteilt wird) zählt nicht als Ende — sonst würde jeder nur-
+    // Datum-Termin fälschlich auf 10:00 statt start+1h enden.
+    let end_given =
+        !raw.end_local.trim().is_empty() || !raw.end_time.trim().is_empty();
+    let end = if end_given {
+        resolve_datetime(&raw.end_local, &raw.date, &raw.end_time, "10:00")
+            .or_else(|| start.as_deref().and_then(plus_one_hour))
+    } else {
         // Pi hat das `end fehlt → start+1h` nicht beachtet — wir holen
         // das hier nach. Lieber selbst Default setzen als auf
         // "empty" werfen.
         start.as_deref().and_then(plus_one_hour)
-    } else {
-        normalize_local_datetime(end_raw)
     };
 
     match (start, end) {
@@ -354,6 +433,89 @@ fn normalize_local_datetime(raw: &str) -> Option<String> {
         return None;
     }
     Some(normalized)
+}
+
+/// Baut aus den diversen pi-Feld-Varianten eine `YYYY-MM-DDTHH:MM`-
+/// Lokalzeit. Quellen in Prioritätsreihenfolge:
+///   1. Ein volles Datetime-Feld (`start_local` / `start` / …), das schon
+///      Datum + Zeit trägt und via `normalize_local_datetime` durchgeht.
+///   2. Sonst: Datum aus dem Datetime-Feld ODER separatem `date`-Feld,
+///      kombiniert mit Zeit aus separatem `*_time`-Feld ODER (falls das
+///      Modell nur ein Datum lieferte) dem `default_time`-Fallback.
+/// `None`, wenn sich nicht mal ein Datum finden lässt.
+fn resolve_datetime(
+    datetime_raw: &str,
+    date_raw: &str,
+    time_raw: &str,
+    default_time: &str,
+) -> Option<String> {
+    let dt = datetime_raw.trim();
+    // Schon perfektes `YYYY-MM-DDTHH:MM` (oder eine der normalisierbaren
+    // Varianten)? Dann direkt übernehmen.
+    if let Some(n) = normalize_local_datetime(dt) {
+        return Some(n);
+    }
+    // Datum: erst aus dem Datetime-Feld (falls es date-only war), sonst
+    // aus dem separaten `date`-Feld.
+    let date = first_date(dt).or_else(|| first_date(date_raw.trim()))?;
+    // Zeit: separates Zeit-Feld gewinnt, dann eine Zeit im Datetime-Feld,
+    // sonst der Default (09:00 für Start, 10:00 fürs Ende).
+    let time = first_time(time_raw)
+        .or_else(|| first_time(dt))
+        .unwrap_or_else(|| default_time.to_string());
+    // Final durch denselben strikten Formatcheck jagen.
+    normalize_local_datetime(&format!("{date}T{time}"))
+}
+
+/// Extrahiert ein führendes ISO-Datum `YYYY-MM-DD` aus `s`. Toleriert
+/// Nachlauf (z. B. `2026-07-23T15:00` oder `2026-07-23 (Do)`), verlangt
+/// aber das strikte Präfix-Muster. `None`, wenn's nicht passt.
+fn first_date(s: &str) -> Option<String> {
+    let b = s.trim().as_bytes();
+    if b.len() >= 10
+        && b[0].is_ascii_digit()
+        && b[1].is_ascii_digit()
+        && b[2].is_ascii_digit()
+        && b[3].is_ascii_digit()
+        && b[4] == b'-'
+        && b[5].is_ascii_digit()
+        && b[6].is_ascii_digit()
+        && b[7] == b'-'
+        && b[8].is_ascii_digit()
+        && b[9].is_ascii_digit()
+    {
+        // Safe: die ersten 10 Bytes sind alle ASCII.
+        Some(s.trim()[..10].to_string())
+    } else {
+        None
+    }
+}
+
+/// Extrahiert eine `HH:MM`-Uhrzeit aus den üblichen Modell-Ausgaben:
+/// `"15:00"`, `"15:00:00"`, `"15"`, `"9:5"`, `"15:00 Uhr"`, `"...T15:00"`.
+/// Zwei-stellig normalisiert. `None` bei allem, was keine plausible
+/// Uhrzeit ist (insb. ein reines Datum ohne `:` und > 23).
+fn first_time(s: &str) -> Option<String> {
+    let s = s.trim().trim_end_matches("Uhr").trim();
+    if s.is_empty() {
+        return None;
+    }
+    // Erstes Whitespace-Token (schneidet " CET" o. Ä. ab), dann alles
+    // hinter einem evtl. `T`-Separator (Datetime-Reste).
+    let head = s.split_whitespace().next().unwrap_or(s);
+    let head = head.rsplit('T').next().unwrap_or(head);
+    let (h_str, m_str) = match head.split_once(':') {
+        Some((h, rest)) => (h, rest.split(':').next().unwrap_or("00")),
+        // Nackte Stunde "15" → :00. Ein reines Datum "2026-07-23" hat
+        // keinen ':' und scheitert hier an `parse()` (enthält '-').
+        None => (head, "00"),
+    };
+    let h: u32 = h_str.trim().parse().ok()?;
+    let m: u32 = m_str.trim().parse().ok()?;
+    if h > 23 || m > 59 {
+        return None;
+    }
+    Some(format!("{h:02}:{m:02}"))
 }
 
 /// Suche den Anfang eines `+HH:MM` / `-HH:MM`-Suffix. Liefert den Index
@@ -477,6 +639,119 @@ mod tests {
         assert_eq!(
             plus_one_hour("2026-05-19T19:00"),
             Some("2026-05-19T20:00".to_string())
+        );
+    }
+
+    #[test]
+    fn first_date_extracts_iso_prefix() {
+        assert_eq!(first_date("2026-07-23"), Some("2026-07-23".to_string()));
+        assert_eq!(
+            first_date("2026-07-23T15:00"),
+            Some("2026-07-23".to_string())
+        );
+        assert_eq!(first_date("23.07.2026"), None);
+        assert_eq!(first_date(""), None);
+    }
+
+    #[test]
+    fn first_time_parses_common_forms() {
+        assert_eq!(first_time("15:00"), Some("15:00".to_string()));
+        assert_eq!(first_time("15:00:00"), Some("15:00".to_string()));
+        assert_eq!(first_time("9:5"), Some("09:05".to_string()));
+        assert_eq!(first_time("15"), Some("15:00".to_string()));
+        assert_eq!(first_time("15:00 Uhr"), Some("15:00".to_string()));
+        assert_eq!(first_time("2026-07-23T15:00"), Some("15:00".to_string()));
+        // Ein reines Datum ist keine Uhrzeit.
+        assert_eq!(first_time("2026-07-23"), None);
+        assert_eq!(first_time(""), None);
+        assert_eq!(first_time("25:00"), None);
+    }
+
+    #[test]
+    fn resolve_datetime_prefers_full_field() {
+        assert_eq!(
+            resolve_datetime("2026-07-23T15:00", "", "", "09:00"),
+            Some("2026-07-23T15:00".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_datetime_combines_date_and_time_fields() {
+        // Shape: {date, start_time} — Modell trennt Datum und Zeit.
+        assert_eq!(
+            resolve_datetime("", "2026-07-23", "15:00", "09:00"),
+            Some("2026-07-23T15:00".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_datetime_date_only_uses_default_time() {
+        // Shape: {start: "2026-07-23"} — nur Datum, keine Zeit.
+        assert_eq!(
+            resolve_datetime("2026-07-23", "", "", "09:00"),
+            Some("2026-07-23T09:00".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_datetime_none_without_any_date() {
+        assert_eq!(resolve_datetime("", "", "15:00", "09:00"), None);
+    }
+
+    /// Voller Parse-Pfad für die reproduzierten Fehl-Shapes kleinerer
+    /// Modelle: das JSON darf jetzt zu einem gültigen Draft führen statt
+    /// auf `Empty` zu fallen.
+    fn parse_shape(json: &str) -> Option<(String, String)> {
+        let raw: RawPiOutput = serde_json::from_str(json).unwrap();
+        let start = resolve_datetime(&raw.start_local, &raw.date, &raw.start_time, "09:00");
+        let end_given =
+            !raw.end_local.trim().is_empty() || !raw.end_time.trim().is_empty();
+        let end = if end_given {
+            resolve_datetime(&raw.end_local, &raw.date, &raw.end_time, "10:00")
+                .or_else(|| start.as_deref().and_then(plus_one_hour))
+        } else {
+            start.as_deref().and_then(plus_one_hour)
+        };
+        match (start, end) {
+            (Some(s), Some(e)) => Some((s, e)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn parses_start_end_dateonly_shape() {
+        // {"summary":"Video Call","start":"2026-07-23","end":"2026-07-23"}
+        let got = parse_shape(
+            r#"{"summary":"Video Call","start":"2026-07-23","end":"2026-07-23"}"#,
+        );
+        // start default 09:00; end explizit genannt (date-only) → default 10:00.
+        assert_eq!(
+            got,
+            Some(("2026-07-23T09:00".to_string(), "2026-07-23T10:00".to_string()))
+        );
+    }
+
+    #[test]
+    fn parses_date_starttime_shape() {
+        // {"summary":"Video-Kaffee","date":"2026-07-23","start_time":"15:00","end_time":null,"location":"..."}
+        let got = parse_shape(
+            r#"{"summary":"Video-Kaffee","date":"2026-07-23","start_time":"15:00","end_time":null,"location":"https://meet.google.com/xzu/"}"#,
+        );
+        // end_time null → nicht explizit → start+1h.
+        assert_eq!(
+            got,
+            Some(("2026-07-23T15:00".to_string(), "2026-07-23T16:00".to_string()))
+        );
+    }
+
+    #[test]
+    fn parses_canonical_local_shape_still() {
+        let got = parse_shape(
+            r#"{"summary":"X","start_local":"2026-05-19T19:00","end_local":"2026-05-19T20:00"}"#,
+        );
+        assert_eq!(
+            got,
+            Some(("2026-05-19T19:00".to_string(), "2026-05-19T20:00".to_string()))
         );
     }
 }
