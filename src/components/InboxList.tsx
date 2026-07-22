@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
-import type { EnvelopeSummary } from "../types";
+import type { TFunction } from "i18next";
+import type { EnvelopeSummary, SearchCoverage } from "../types";
 import { scheduledGlyph, scheduledTooltip } from "../utils/lifetimeTag";
 import { SearchPanel } from "./SearchPanel";
 
@@ -24,6 +25,11 @@ type Props = {
   onSearchSubmit?: (v: string) => void;
   searchError?: string | null;
   searching?: boolean;
+  /** Hybrid search status: coverage of the local index + whether the
+   *  IMAP server leg is still running. Rendered as a small status line
+   *  under the search box while a query is active. */
+  searchCoverage?: SearchCoverage | null;
+  serverSearching?: boolean;
   /** When embedded in a parent column (with the account filter above), skip
    *  the fixed width + right border — the parent owns the chrome. */
   embedded?: boolean;
@@ -72,6 +78,8 @@ export function InboxList({
   onSearchSubmit,
   searchError,
   searching,
+  searchCoverage,
+  serverSearching,
   embedded,
   junkBadgeTone = "candidate",
   onNearBottom,
@@ -201,6 +209,19 @@ export function InboxList({
             style={{ color: "var(--fg-subtle)" }}
           >
             {t("search.hint")}
+          </p>
+        )}
+        {/* Hybrid-search status line: while the server leg runs it
+            says so; afterwards it states how far back the local index
+            reaches (and that the backfill is extending it). */}
+        {!searchError && searchValue.trim() && (serverSearching || searchCoverage) && (
+          <p
+            className="mt-1 text-[10px]"
+            style={{ color: "var(--fg-subtle)" }}
+          >
+            {serverSearching
+              ? t("search.serverSearching")
+              : coverageLine(searchCoverage, t)}
           </p>
         )}
         {/* "Über alle Ordner suchen" toggle — only when the parent
@@ -414,6 +435,17 @@ export function InboxList({
                           {m.subject || "(kein Betreff)"}
                         </div>
                       </div>
+                      {m.snippet && (
+                        // Trefferkontext aus der FTS-Suche — zeigt,
+                        // *warum* die Mail matcht (Betreff, Absender
+                        // oder Body-Fenster um den ersten Treffer).
+                        <div
+                          className="mt-0.5 truncate text-[11px]"
+                          style={{ color: "var(--fg-subtle)" }}
+                        >
+                          <SnippetText text={m.snippet} />
+                        </div>
+                      )}
                     </div>
                     {m.flagged && (
                       <span style={{ color: "#f59e0b" }} aria-hidden>★</span>
@@ -484,6 +516,62 @@ function EmptyState({ searching }: { searching: boolean }) {
       </div>
     </div>
   );
+}
+
+/**
+ * Status line under the search box once the server leg has finished:
+ * either "local index is complete" or "indexed back to <date>,
+ * backfill is catching up". Empty string when there's nothing
+ * meaningful to say (no mail indexed yet).
+ */
+function coverageLine(
+  c: SearchCoverage | null | undefined,
+  t: TFunction,
+): string {
+  if (!c || c.indexedEnvelopes === 0) return "";
+  if (c.incompleteFolders === 0 && !c.backfillRunning) {
+    return t("search.coverageComplete", { count: c.indexedEnvelopes });
+  }
+  const oldest = c.oldestDateUtc ? new Date(c.oldestDateUtc) : null;
+  const date =
+    oldest && !Number.isNaN(oldest.getTime())
+      ? oldest.toLocaleDateString(undefined, { year: "numeric", month: "short" })
+      : "—";
+  return t("search.coveragePartial", { count: c.indexedEnvelopes, date });
+}
+
+/**
+ * Rendert ein Backend-Snippet mit `<mark>`-Markern als sichere React-
+ * Knoten — der Snippet-Text stammt aus Mail-Inhalten und darf nie als
+ * HTML injiziert werden; hier wird er ausschließlich als Textknoten
+ * gesetzt und nur die Marker werden in echte <mark>-Elemente
+ * übersetzt.
+ */
+function SnippetText({ text }: { text: string }) {
+  const nodes: ReactNode[] = [];
+  const re = /<mark>([\s\S]*?)<\/mark>/g;
+  let last = 0;
+  let key = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) nodes.push(text.slice(last, m.index));
+    nodes.push(
+      <mark
+        key={key++}
+        style={{
+          background: "rgba(234,179,8,0.25)",
+          color: "inherit",
+          borderRadius: 2,
+          padding: "0 1px",
+        }}
+      >
+        {m[1]}
+      </mark>,
+    );
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) nodes.push(text.slice(last));
+  return <>{nodes}</>;
 }
 
 function formatDate(iso: string): string {

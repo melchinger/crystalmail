@@ -277,8 +277,15 @@ fn push_folded(buf: &mut String, line: &str) {
     while start < bytes.len() {
         let max = if first { LIMIT } else { LIMIT - 1 };
         let mut end = (start + max).min(bytes.len());
-        // Walk back to a UTF-8 codepoint boundary.
-        while end > start && (bytes[end - 1] & 0xC0) == 0x80 {
+        // Walk back to a UTF-8 codepoint boundary. `end` is a valid
+        // boundary iff it's at the string end or `bytes[end]` is not a
+        // continuation byte — checking `bytes[end - 1]` (the byte *before*
+        // the cut) is wrong: it stops on a multi-byte *lead* byte and
+        // slices mid-codepoint, panicking on e.g. a '•' (U+2022) that
+        // straddles the 75-octet limit. `is_char_boundary` encodes the
+        // correct test. A single codepoint is ≤4 bytes ≤ `max`, so this
+        // always makes progress (`end` never collapses onto `start`).
+        while end > start && !line.is_char_boundary(end) {
             end -= 1;
         }
         if !first {
@@ -1022,6 +1029,41 @@ END:VCALENDAR\r\n";
                 line.len()
             );
         }
+    }
+
+    #[test]
+    fn folds_multibyte_char_straddling_limit() {
+        // Regression: a 3-byte codepoint ('•', U+2022) whose bytes straddle
+        // the 75-octet fold boundary used to panic ("not a char boundary")
+        // because the walk-back checked the wrong byte. Position the bullet
+        // so the naive cut at byte 75 lands in its middle (bytes 74..77).
+        let line = format!("{}•tail{}", "a".repeat(74), "x".repeat(40));
+        let mut buf = String::new();
+        push_folded(&mut buf, &line); // must not panic
+
+        // Every physical line (incl. the CRLF + space continuation) ≤75.
+        let pieces: Vec<&str> = buf
+            .split("\r\n")
+            .filter(|s| !s.is_empty())
+            .collect();
+        for l in &pieces {
+            assert!(l.len() <= 75, "line too long ({}): {l:?}", l.len());
+        }
+
+        // RFC 5545 unfolding — strip the CRLF and the single leading space
+        // of each continuation line — must restore the original verbatim.
+        let unfolded: String = pieces
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                if i == 0 {
+                    (*s).to_string()
+                } else {
+                    s.strip_prefix(' ').unwrap_or(s).to_string()
+                }
+            })
+            .collect();
+        assert_eq!(unfolded, line);
     }
 
     #[test]

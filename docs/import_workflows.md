@@ -6,6 +6,10 @@ Composer ab. Damit lassen sich Versand-Schritte aus Python-Scripten,
 Make-Targets, Buchhaltungs-Tools etc. anstoßen — ohne dass die App
 ohne Augenkontakt eine Mail rausschickt.
 
+> Dies ist die **ausgehende** Seite (Draft erzeugen). Die eingehende
+> Seite — Regeln, die auf empfangene Mails automatisch reagieren —
+> steht in [workflow_rules.md](workflow_rules.md).
+
 > **Sicherheits-Modell:** Der Trigger erzeugt **immer nur einen Draft**,
 > niemals einen automatischen Versand. Der Send-Knopf bleibt manuell.
 

@@ -28,6 +28,8 @@ type Props = {
   events: Commitment[];
   /** Subscription id → display info. See CalendarWeekView for details. */
   subscriptionsById: ReadonlyMap<string, SubInfo>;
+  /** Color for local (non-subscription) events. `undefined` ⇒ accent. */
+  localColor?: string;
   onPickEvent: (id: string) => void;
   /** Click on an empty area of a day cell. Defaults to 09:00 local
    *  on that day; the parent opens the EventEditor with that
@@ -52,6 +54,7 @@ export function CalendarMonthView({
   anchorDate,
   events,
   subscriptionsById,
+  localColor,
   onPickEvent,
   onCreateAt,
 }: Props) {
@@ -122,6 +125,7 @@ export function CalendarMonthView({
             timedEvents={timed}
             allDayEvents={allDay}
             subscriptionsById={subscriptionsById}
+            localColor={localColor}
             onPickEvent={onPickEvent}
             onCreateAt={onCreateAt}
           />
@@ -140,6 +144,7 @@ function WeekRow({
   timedEvents,
   allDayEvents,
   subscriptionsById,
+  localColor,
   onPickEvent,
   onCreateAt,
 }: {
@@ -149,6 +154,7 @@ function WeekRow({
   timedEvents: Commitment[];
   allDayEvents: Commitment[];
   subscriptionsById: ReadonlyMap<string, SubInfo>;
+  localColor?: string;
   onPickEvent: (id: string) => void;
   onCreateAt: (start: Date) => void;
 }) {
@@ -263,7 +269,7 @@ function WeekRow({
                     }}
                     className="truncate rounded px-1 py-0.5 text-left text-[10px] hover:opacity-80"
                     style={{
-                      background: eventColor(e, subscriptionsById),
+                      background: eventColor(e, subscriptionsById, localColor),
                       color: "#fff",
                     }}
                     title={`${e.summary ?? "—"}\n${TIME_FMT.format(new Date(e.startAt))}`}
@@ -305,7 +311,7 @@ function WeekRow({
               width: `calc(${(bar.spanCols / 7) * 100}% - 4px)`,
               top: `calc(1.4em + ${idx * 18}px)`,
               height: "16px",
-              background: eventColor(bar.commitment, subscriptionsById),
+              background: eventColor(bar.commitment, subscriptionsById, localColor),
               color: "#fff",
               border: "1px solid rgba(0,0,0,0.1)",
             }}

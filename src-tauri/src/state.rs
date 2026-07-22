@@ -163,10 +163,21 @@ pub struct CalendarConfig {
     /// state correctly.
     #[serde(default = "default_compaction_enabled")]
     pub compaction_enabled: bool,
+    /// Hex color (`#rrggbb`) used to tint the local/standard calendar's
+    /// events — everything that isn't owned by an iCal subscription
+    /// (manually created, ICS-imported, negotiation). Lets the user
+    /// distinguish their own entries from subscribed feeds, mirroring the
+    /// per-subscription color. Default is the palette's first blue.
+    #[serde(default = "default_local_color")]
+    pub color: String,
 }
 
 fn default_folder_path() -> String {
     "INBOX/TimeProtocol/Calendar".to_string()
+}
+
+fn default_local_color() -> String {
+    "#3b82f6".to_string()
 }
 
 fn default_auto_sync_interval() -> u64 {
@@ -195,6 +206,7 @@ impl Default for CalendarConfig {
             idle_enabled: default_idle_enabled(),
             sync_on_mutation: default_sync_on_mutation(),
             compaction_enabled: default_compaction_enabled(),
+            color: default_local_color(),
         }
     }
 }
@@ -210,6 +222,10 @@ pub struct AppState {
     /// Prevents the same account from spawning two parallel IMAP sessions
     /// when the worker is triggered both from sync and from the frontend.
     pub prefetch_running: std::sync::Mutex<HashSet<AccountId>>,
+    /// Account IDs whose background backfill worker is currently pulling
+    /// older envelopes (30-day window → full history). Same de-dupe
+    /// rationale as `prefetch_running`.
+    pub backfill_running: std::sync::Mutex<HashSet<AccountId>>,
     /// Cancel-tokens for in-flight `open_message` body fetches, keyed by
     /// message id. Archive/delete/move fire the matching token before
     /// starting their own IMAP op so the fetch drops its session early
@@ -287,6 +303,7 @@ impl Default for AppState {
             pi_rpc: Mutex::new(None),
             db: OnceCell::new(),
             prefetch_running: std::sync::Mutex::new(HashSet::new()),
+            backfill_running: std::sync::Mutex::new(HashSet::new()),
             pending_fetch_cancels: std::sync::Mutex::new(HashMap::new()),
             active_spam_pi: Mutex::new(None),
             spam_cancel_requested: AtomicBool::new(false),

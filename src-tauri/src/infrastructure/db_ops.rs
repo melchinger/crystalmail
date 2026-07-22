@@ -320,21 +320,25 @@ pub(super) fn upsert_envelope(
     )?;
 
     // Refresh the FTS5 row. We `DELETE` first because fts5 contentless tables
-    // don't support UPSERT; the second insert carries the current text.
+    // don't support UPSERT; the insert carries the current text.
+    //
+    // `body_text` is only `Some` when the caller actually has body text
+    // (body-store path). Header-only re-syncs pass `None` — and the
+    // SINCE-30d sync window re-upserts every cached envelope on every
+    // run. Falling back to the already-cached `bodies.plain_text` keeps
+    // a previously indexed body searchable instead of wiping it with ""
+    // on every sync.
     tx.execute(
         "DELETE FROM fts_envelopes WHERE rowid = (SELECT rowid FROM envelopes WHERE id = ?1)",
         params![e.id.0.to_string()],
     )?;
     tx.execute(
         "INSERT INTO fts_envelopes (rowid, subject, from_text, to_text, body_text)
-         VALUES ((SELECT rowid FROM envelopes WHERE id = ?1), ?2, ?3, ?4, ?5)",
-        params![
-            e.id.0.to_string(),
-            e.subject,
-            from_text,
-            to_text,
-            body_text.unwrap_or(""),
-        ],
+         SELECT e.rowid, ?2, ?3, ?4,
+                COALESCE(?5, (SELECT b.plain_text FROM bodies b WHERE b.envelope_id = e.id), '')
+           FROM envelopes e
+          WHERE e.id = ?1",
+        params![e.id.0.to_string(), e.subject, from_text, to_text, body_text],
     )?;
 
     // Adress-History side-effect: jede From/To/Cc-Adresse upserten,
@@ -570,6 +574,79 @@ pub(super) fn store_body(
 
     tx.commit()?;
     Ok(())
+}
+
+/// Anzahl Envelopes ohne zugehörige FTS-Zeile. Dient als
+/// Integritätsprobe: Migration 0002 hat `fts_envelopes` gedroppt und nur
+/// das 30-Tage-Sync-Fenster hat den Index wieder befüllt — ältere
+/// gecachte Envelopes fehlen seitdem still in der Suche. `> 0` heißt:
+/// `rebuild_fts_index` ist fällig.
+pub(super) fn fts_missing_count(conn: &Connection) -> Result<i64, DbError> {
+    let n = conn.query_row(
+        "SELECT COUNT(*)
+           FROM envelopes e
+          WHERE NOT EXISTS (
+                SELECT 1 FROM fts_envelopes f WHERE f.rowid = e.rowid
+          )",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(n)
+}
+
+/// Fügt FTS-Zeilen für alle Envelopes nach, die keine haben
+/// (Self-Healing — siehe `fts_missing_count`). from_text/to_text werden
+/// exakt wie in `upsert_envelope` aus den JSON-Adressspalten abgeleitet,
+/// body_text kommt aus dem gecachten Body, sofern einer existiert.
+/// Bestehende FTS-Zeilen bleiben unangetastet. Eine Transaktion;
+/// Rückgabe ist die Anzahl eingefügter Zeilen.
+pub(super) fn rebuild_fts_index(conn: &mut Connection) -> Result<usize, DbError> {
+    let tx = conn.transaction()?;
+    let mut inserted = 0usize;
+    {
+        // Erst materialisieren, dann inserten — ein offener SELECT-Cursor
+        // auf `envelopes` neben INSERTs in `fts_envelopes` wäre zwar
+        // erlaubt (verschiedene Tabellen), aber das Collect hält den
+        // Control-Flow simpel und die Fehlerbehandlung linear.
+        let mut missing = tx.prepare(
+            "SELECT e.rowid, e.subject, e.from_json, e.to_json,
+                    (SELECT b.plain_text FROM bodies b WHERE b.envelope_id = e.id)
+               FROM envelopes e
+              WHERE NOT EXISTS (
+                    SELECT 1 FROM fts_envelopes f WHERE f.rowid = e.rowid
+              )",
+        )?;
+        let rows = missing
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut insert = tx.prepare(
+            "INSERT INTO fts_envelopes (rowid, subject, from_text, to_text, body_text)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        for (rowid, subject, from_json, to_json, plain) in rows {
+            let from_list: Vec<Address> = serde_json::from_str(&from_json).unwrap_or_default();
+            let to_list: Vec<Address> = serde_json::from_str(&to_json).unwrap_or_default();
+            insert.execute(params![
+                rowid,
+                subject,
+                address_list_to_text(&from_list),
+                address_list_to_text(&to_list),
+                plain.unwrap_or_default(),
+            ])?;
+            inserted += 1;
+        }
+    }
+    tx.commit()?;
+    Ok(inserted)
 }
 
 pub(super) fn delete_envelopes(
@@ -1444,4 +1521,192 @@ fn fts_upsert_contact(tx: &Transaction<'_>, c: &Contact) -> rusqlite::Result<()>
         ],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::infrastructure::migrations;
+    use uuid::Uuid;
+
+    /// Volles Produktiv-Schema (alle Migrationen) in-memory — so testen
+    /// wir gegen die echte Tabelle statt gegen eine nachgebaute Kopie,
+    /// die still auseinanderlaufen kann.
+    fn test_db() -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrations::apply(&mut conn).unwrap();
+        conn
+    }
+
+    fn seed_account_and_folder(conn: &Connection) -> (AccountId, FolderId) {
+        let account_id = AccountId(Uuid::new_v4());
+        conn.execute(
+            "INSERT INTO accounts (id, display_name, address, from_name, color,
+                 imap_host, imap_port, imap_tls, smtp_host, smtp_port, smtp_tls,
+                 credential_kind, credential_entry, archive_folder, created_at)
+             VALUES (?1, 'Test', 'user@example.com', 'User', '#000000',
+                 'imap.example.com', 993, 1, 'smtp.example.com', 465, 1,
+                 'password', 'keyring-entry', 'Archive', '2024-01-01T00:00:00Z')",
+            params![account_id.0.to_string()],
+        )
+        .unwrap();
+        let folder_id = ensure_folder(conn, &account_id, "INBOX").unwrap();
+        (account_id, folder_id)
+    }
+
+    fn envelope(
+        account_id: &AccountId,
+        folder_id: &FolderId,
+        uid: u32,
+        subject: &str,
+    ) -> Envelope {
+        Envelope {
+            id: MessageId(Uuid::new_v4()),
+            account_id: AccountId(account_id.0),
+            folder_id: FolderId(folder_id.0),
+            imap_uid: uid,
+            message_id_header: None,
+            from: vec![Address {
+                name: Some("Kunde".into()),
+                email: "kunde@example.com".into(),
+            }],
+            to: vec![Address {
+                name: None,
+                email: "user@example.com".into(),
+            }],
+            cc: vec![],
+            subject: subject.to_string(),
+            date: Utc::now(),
+            flags: Flags::default(),
+            references: vec![],
+            size_bytes: 1000,
+            body_cached: false,
+            has_attachments: false,
+        }
+    }
+
+    fn fts_match_count(conn: &Connection, query: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM fts_envelopes WHERE fts_envelopes MATCH ?1",
+            params![query],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Regressionstest für den Sync-Bug: der SINCE-30d-Resync upsertet
+    /// jede Mail des Fensters bei jedem Lauf mit body_text=None — das
+    /// darf einen bereits indexierten Body nicht aus dem FTS-Index
+    /// werfen.
+    #[test]
+    fn header_resync_preserves_indexed_body_text() {
+        let mut conn = test_db();
+        let (account_id, folder_id) = seed_account_and_folder(&conn);
+        let env = envelope(&account_id, &folder_id, 1, "Vorgang 4711");
+        upsert_envelope(&mut conn, &env, None).unwrap();
+
+        // Ohne Body ist der Body-Begriff nicht auffindbar.
+        assert_eq!(fts_match_count(&conn, "rechnung"), 0);
+
+        // Body landet im Cache (Prefetch/Öffnen) → FTS bekommt den Text.
+        store_body(
+            &mut conn,
+            &env.id,
+            b"raw",
+            Some("Ihre Rechnung für April"),
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(fts_match_count(&conn, "rechnung"), 1);
+
+        // Header-only Re-Sync derselben Mail (body_text=None).
+        let resync = envelope_with_id(&env, 1);
+        upsert_envelope(&mut conn, &resync, None).unwrap();
+        assert_eq!(
+            fts_match_count(&conn, "rechnung"),
+            1,
+            "Resync hat den indexierten Body-Text aus dem FTS-Index geworfen"
+        );
+    }
+
+    /// Baut einen Envelope mit denselben Ids wie `src` (Re-Sync einer
+    /// bereits bekannten UID).
+    fn envelope_with_id(src: &Envelope, uid: u32) -> Envelope {
+        Envelope {
+            id: MessageId(src.id.0),
+            account_id: AccountId(src.account_id.0),
+            folder_id: FolderId(src.folder_id.0),
+            imap_uid: uid,
+            message_id_header: None,
+            from: vec![Address {
+                name: Some("Kunde".into()),
+                email: "kunde@example.com".into(),
+            }],
+            to: vec![],
+            cc: vec![],
+            subject: src.subject.clone(),
+            date: Utc::now(),
+            flags: Flags::default(),
+            references: vec![],
+            size_bytes: 1000,
+            body_cached: false,
+            has_attachments: false,
+        }
+    }
+
+    /// Ein explizit mitgelieferter body_text gewinnt weiterhin gegen
+    /// den gecachten Body (z.B. wenn der Body-Store-Pfad frischeren
+    /// Text hat).
+    #[test]
+    fn explicit_body_text_overrides_cached() {
+        let mut conn = test_db();
+        let (account_id, folder_id) = seed_account_and_folder(&conn);
+        let env = envelope(&account_id, &folder_id, 1, "Vorgang 4711");
+        upsert_envelope(&mut conn, &env, None).unwrap();
+        store_body(&mut conn, &env.id, b"raw", Some("alter text"), None, false).unwrap();
+
+        let resync = envelope_with_id(&env, 1);
+        upsert_envelope(&mut conn, &resync, Some("neuer text")).unwrap();
+
+        assert_eq!(fts_match_count(&conn, "neuer"), 1);
+        assert_eq!(fts_match_count(&conn, "alter"), 0);
+    }
+
+    /// Self-Healing nach dem 0002-Indexverlust: fehlende Zeilen werden
+    /// aus envelopes + bodies rekonstruiert, inkl. aus JSON abgeleiteter
+    /// Adress-Texte.
+    #[test]
+    fn rebuild_restores_missing_rows() {
+        let mut conn = test_db();
+        let (account_id, folder_id) = seed_account_and_folder(&conn);
+
+        let e1 = envelope(&account_id, &folder_id, 1, "Newsletter Juni");
+        upsert_envelope(&mut conn, &e1, None).unwrap();
+        let e2 = envelope(&account_id, &folder_id, 2, "Vorgang 4711");
+        upsert_envelope(&mut conn, &e2, None).unwrap();
+        store_body(
+            &mut conn,
+            &e2.id,
+            b"raw",
+            Some("Ihre Rechnung für April"),
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(fts_missing_count(&conn).unwrap(), 0);
+
+        // Simuliert den Verlust durch Migration 0002.
+        conn.execute("DELETE FROM fts_envelopes", []).unwrap();
+        assert_eq!(fts_missing_count(&conn).unwrap(), 2);
+
+        let inserted = rebuild_fts_index(&mut conn).unwrap();
+        assert_eq!(inserted, 2);
+        assert_eq!(fts_missing_count(&conn).unwrap(), 0);
+
+        assert_eq!(fts_match_count(&conn, "newsletter"), 1); // subject
+        assert_eq!(fts_match_count(&conn, "rechnung"), 1); // body aus bodies
+        assert_eq!(fts_match_count(&conn, "kunde"), 2); // from_text aus JSON
+    }
 }

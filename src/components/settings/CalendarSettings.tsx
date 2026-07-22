@@ -66,6 +66,9 @@ export function CalendarSettings({ accounts }: Props) {
     try {
       await invoke<void>("cal_set_config", { config });
       setSavedAt(Date.now());
+      // Let an open CalendarView pick up the new local-calendar color
+      // (and any other config change) without an app restart.
+      window.dispatchEvent(new CustomEvent("cm:calendar-config-changed"));
     } catch (e) {
       setError(String(e));
     } finally {
@@ -92,6 +95,28 @@ export function CalendarSettings({ accounts }: Props) {
         />
         <span>{t("settings.calendar.enabled")}</span>
       </label>
+
+      {/* Standard-calendar color. Applies in both local-only and IMAP
+          mode, so it stays enabled regardless of `config.enabled`.
+          Persisted with the rest of the config on "Speichern". */}
+      <div className="flex items-center gap-2 text-sm">
+        <ColorSwatch
+          color={config.color}
+          onPick={(c) => update({ color: c })}
+        />
+        <span style={{ color: "var(--fg-base)" }}>
+          {t("settings.calendar.localColor")}
+        </span>
+        <span
+          className="font-mono text-xs"
+          style={{ color: "var(--fg-subtle)" }}
+        >
+          {config.color}
+        </span>
+      </div>
+      <p className="-mt-2 text-xs" style={{ color: "var(--fg-subtle)" }}>
+        {t("settings.calendar.localColorHint")}
+      </p>
 
       <label className="flex flex-col gap-1 text-sm">
         <span style={{ color: "var(--fg-muted)" }}>

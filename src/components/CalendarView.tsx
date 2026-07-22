@@ -15,6 +15,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import type {
   AccountSummary,
+  CalendarConfig,
   CalendarSubscription,
   CalendarSyncReport,
   Commitment,
@@ -100,6 +101,9 @@ export function CalendarView({
   // time, but we hold the full record so a later expansion (per-source
   // toggles, status icons, …) doesn't need a second round-trip.
   const [subscriptions, setSubscriptions] = useState<CalendarSubscription[]>([]);
+  // Color for the local/standard calendar (events without a subscription).
+  // Read from CalendarConfig; falls back to the accent var until loaded.
+  const [localColor, setLocalColor] = useState<string | undefined>(undefined);
   const [error, setError] = useState<string | null>(null);
   const [editor, setEditor] = useState<EditorState>(null);
   const [showPast, setShowPast] = useState(false);
@@ -137,7 +141,7 @@ export function CalendarView({
       from.setMonth(from.getMonth() - 12);
       const to = new Date(now);
       to.setMonth(to.getMonth() + 12);
-      const [rows, subs] = await Promise.all([
+      const [rows, subs, cfg] = await Promise.all([
         invoke<Commitment[]>("cal_list_in_range", {
           from: from.toISOString(),
           to: to.toISOString(),
@@ -147,9 +151,11 @@ export function CalendarView({
           // still render if the store hasn't initialised yet.
           [] as CalendarSubscription[],
         ),
+        invoke<CalendarConfig>("cal_get_config").catch(() => null),
       ]);
       setEvents(rows);
       setSubscriptions(subs);
+      setLocalColor(cfg?.color);
       setError(null);
     } catch (e) {
       setError(String(e));
@@ -159,6 +165,15 @@ export function CalendarView({
 
   useEffect(() => {
     void refresh();
+  }, [refresh]);
+
+  // Re-fetch when the calendar config is saved in Settings, so a changed
+  // standard-calendar color shows up immediately (no app restart).
+  useEffect(() => {
+    const onConfigChanged = () => void refresh();
+    window.addEventListener("cm:calendar-config-changed", onConfigChanged);
+    return () =>
+      window.removeEventListener("cm:calendar-config-changed", onConfigChanged);
   }, [refresh]);
 
   // Deep-Link-Konsum: ein gesetztes `openCommitmentId` ⇒ EventEditor im
@@ -530,6 +545,7 @@ export function CalendarView({
             anchorDate={anchorDate}
             events={events}
             subscriptionsById={subscriptionsById}
+            localColor={localColor}
             onPickEvent={(id) =>
               setEditor({ mode: "edit", commitmentId: id })
             }
@@ -540,6 +556,7 @@ export function CalendarView({
             anchorDate={anchorDate}
             events={events}
             subscriptionsById={subscriptionsById}
+            localColor={localColor}
             onPickEvent={(id) =>
               setEditor({ mode: "edit", commitmentId: id })
             }

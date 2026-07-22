@@ -9,11 +9,13 @@ use tauri::{AppHandle, Manager};
 use serde::Serialize;
 
 use crate::application::attachments::{self, AttachmentMeta};
+use crate::application::backfill;
 use crate::application::body;
 use crate::application::flags as flags_app;
 use crate::application::mark_read;
 use crate::application::message_ops;
 use crate::application::prefetch;
+use crate::application::server_search;
 use crate::application::smtp::{self, SendMailRequest};
 use crate::application::sync::{self, SyncReport};
 use crate::domain::account::AccountId;
@@ -117,6 +119,87 @@ pub async fn search_advanced(
     .map_err(|e| e.to_string())
 }
 
+/// Manueller Repair-Pfad für den FTS-Suchindex: fügt fehlende
+/// `fts_envelopes`-Zeilen aus envelopes + bodies neu ein. Derselbe
+/// Self-Healing-Lauf läuft beim App-Start automatisch, wenn die
+/// Integritätsprobe Lücken findet — dieses Command existiert für den
+/// Settings-/Support-Fall („Suchindex reparieren"). Rückgabe: Anzahl
+/// eingefügter Zeilen.
+#[tauri::command]
+pub async fn repair_search_index(app: AppHandle) -> Result<usize, String> {
+    let state = app.state::<AppState>();
+    let db = state.db.get().ok_or("database not ready")?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    db.writer
+        .send(crate::infrastructure::db::WriteCmd::RebuildFtsIndex { ack: tx })
+        .await
+        .map_err(|_| "writer channel closed".to_string())?;
+    rx.await
+        .map_err(|_| "writer dropped ack".to_string())?
+        .map_err(|e| e.to_string())
+}
+
+/// Hybrid search, server leg. Local FTS only covers cached mail; this
+/// command asks the IMAP server(s) directly (`UID SEARCH`), persists
+/// the matching envelopes through the sync pipeline (which also
+/// enriches the local index for next time) and returns them as
+/// EnvelopeSummary rows so the frontend can merge them with the local
+/// FTS hits. Same parameter shape as `search_advanced`.
+#[tauri::command]
+pub async fn search_server(
+    app: AppHandle,
+    fts: String,
+    folder: Option<String>,
+    folder_id: Option<FolderId>,
+    account_id: Option<AccountId>,
+    filters: SearchFilters,
+    limit: u32,
+) -> Result<Vec<EnvelopeSummary>, String> {
+    let state = app.state::<AppState>();
+    let db = state.db.get().ok_or("database not ready")?;
+    server_search::search(
+        &app,
+        db,
+        &fts,
+        folder.as_deref(),
+        folder_id.as_ref(),
+        account_id.as_ref(),
+        &filters,
+        limit,
+    )
+    .await
+}
+
+/// Coverage status for the search UI — the local index scope plus
+/// whether the background backfill is still extending it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchCoverageStatus {
+    pub indexed_envelopes: i64,
+    pub oldest_date_utc: Option<String>,
+    pub incomplete_folders: i64,
+    pub backfill_running: bool,
+}
+
+#[tauri::command]
+pub async fn search_coverage(app: AppHandle) -> Result<SearchCoverageStatus, String> {
+    let state = app.state::<AppState>();
+    let db = state.db.get().ok_or("database not ready")?;
+    let conn = db.reads.get().map_err(|e| e.to_string())?;
+    let cov = queries::search_coverage(&conn).map_err(|e| e.to_string())?;
+    let running = state
+        .backfill_running
+        .lock()
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    Ok(SearchCoverageStatus {
+        indexed_envelopes: cov.indexed_envelopes,
+        oldest_date_utc: cov.oldest_date_utc,
+        incomplete_folders: cov.incomplete_folders,
+        backfill_running: running,
+    })
+}
+
 /// IMAP folder inventory for one account. Drives the sidebar's per-account
 /// expander so the user can jump into any mailbox — not just the canonical
 /// Inbox/Archive/Sent/Drafts/Trash.
@@ -155,6 +238,7 @@ pub async fn sync_account(
     app: AppHandle,
     account_id: AccountId,
     priority_folder: Option<String>,
+    only_priority: Option<bool>,
 ) -> Result<SyncReport, String> {
     let state = app.state::<AppState>();
     let db = state.db.get().ok_or("database not ready")?;
@@ -168,6 +252,14 @@ pub async fn sync_account(
     if let Some(name) = priority_folder {
         let priority_report =
             sync::sync_single_folder(&app, db, account_id, &name).await?;
+
+        // `only_priority` scopes a manual sync to exactly the folder the
+        // user is looking at (e.g. account-filtered + sitting in Sent):
+        // sync that one folder and stop, no background walk of the
+        // remaining specials and no prefetch.
+        if only_priority.unwrap_or(false) {
+            return Ok(priority_report);
+        }
 
         let app2 = app.clone();
         let skip = vec![name];
@@ -186,7 +278,10 @@ pub async fn sync_account(
                     "background sync of remaining folders failed"
                 );
             }
-            prefetch::spawn(app2, account_id);
+            prefetch::spawn(app2.clone(), account_id);
+            // Older-than-window envelopes nachziehen — Guard deduped,
+            // falls der Worker schon läuft.
+            backfill::spawn_for_account(&app2, account_id);
         });
 
         return Ok(priority_report);
@@ -196,6 +291,9 @@ pub async fn sync_account(
     // Opportunistic body prefetch for whatever landed in the sync window.
     // Fire-and-forget — we've already reported the sync success.
     prefetch::spawn(app.clone(), account_id);
+    // Same for the history backfill: manual sync is a natural moment
+    // to (re)kick the resumable older-than-window walk.
+    backfill::spawn_for_account(&app, account_id);
     Ok(report)
 }
 

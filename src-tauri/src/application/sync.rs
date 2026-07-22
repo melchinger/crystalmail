@@ -829,8 +829,11 @@ async fn sync_one_folder(
 /// `uids_sorted` must be ascending (the IMAP set-string we build from
 /// it is passed verbatim to the server — order affects response
 /// order, not correctness, but we emit progress as they come in).
+/// Visibility: `pub(crate)` damit die Server-Suche
+/// (`application::server_search`) Treffer-UIDs über dieselbe Pipeline
+/// persistieren kann (Spam-Rules, Workflow-Match, FTS-Upsert inklusive).
 #[allow(clippy::too_many_arguments)]
-async fn drive_uid_fetch(
+pub(crate) async fn drive_uid_fetch(
     app: &AppHandle,
     db: &DbHandle,
     session: &mut async_imap::Session<

@@ -242,6 +242,14 @@ pub struct EnvelopeSummary {
     /// ausgeführt wurde). Siehe Migration 0025.
     #[serde(default)]
     pub scheduled: Option<crate::domain::workflow::ScheduledActionTag>,
+    /// Trefferkontext mit `<mark>`-Markern — nur bei FTS-Suchen
+    /// befüllt, `None` bei reinen Filter-/Listing-Queries. Wird in
+    /// Rust aus subject/from + gecachtem Body gebaut, weil FTS5
+    /// `snippet()` auf contentless Tabellen (`content=''`) leere
+    /// Strings liefert. Das Frontend rendert die Marker als sichere
+    /// React-Knoten (kein HTML-Injection-Pfad).
+    #[serde(default)]
+    pub snippet: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -331,6 +339,26 @@ pub struct FolderMeta {
     pub name: String,
     pub sync_enabled: bool,
     pub last_sync_ts: Option<DateTime<Utc>>,
+}
+
+/// Folder id for (account, IMAP name), `None` when the folder has no
+/// local row yet. The server-search path uses this to decide between
+/// reusing a folder and creating it via `WriteCmd::EnsureFolder`.
+pub fn find_folder_id(
+    conn: &ReadConn,
+    account_id: &AccountId,
+    name: &str,
+) -> Result<Option<FolderId>, DbError> {
+    conn.query_row(
+        "SELECT id FROM folders WHERE account_id = ?1 AND name = ?2",
+        params![account_id.0.to_string(), name],
+        |row| {
+            let id_str: String = row.get(0)?;
+            Ok(FolderId(parse_uuid_rs(&id_str)?))
+        },
+    )
+    .optional()
+    .map_err(DbError::from)
 }
 
 pub fn get_folder_meta(
@@ -883,8 +911,6 @@ pub fn search_advanced(
 
     // FTS branch joins on rowid; non-FTS branch goes directly against
     // `envelopes`. Folder branch needs a `folders` JOIN either way.
-    // Order-by differs: FTS branch ranks by bm25, non-FTS goes by date
-    // (descending — newest first matches list-view convention).
     let join_folders = folder_clause.is_some();
     let from_clause = if use_fts {
         if join_folders {
@@ -905,11 +931,12 @@ pub fn search_advanced(
         "envelopes e
           JOIN accounts a ON a.id = e.account_id"
     };
-    let order_by = if use_fts {
-        "bm25(fts_envelopes)"
-    } else {
-        "e.date_utc DESC"
-    };
+    // Always sort newest-first by date, FTS or not. Users scanning
+    // search results expect the same chronological order as the inbox
+    // list (most recent on top) rather than an opaque bm25 relevance
+    // ranking — a mail from this morning shouldn't sink below a more
+    // "relevant" one from two years ago.
+    let order_by = "e.date_utc DESC";
 
     let where_sql = where_parts.join(" AND ");
     let sql = format!(
@@ -920,7 +947,342 @@ pub fn search_advanced(
           LIMIT ?{limit_idx}"
     );
 
+    // Eine Statement-Form, zwei mögliche MATCH-Queries: die exakte
+    // Eingabe, plus eine präfix-expandierte Fallback-Variante, wenn
+    // exakt (fast) nichts kommt — „rechnung" soll auch „Rechnungen" /
+    // „Rechnungsnr" finden. Der FTS-Param liegt bei use_fts immer auf
+    // Position 0 von `binds`, darum reicht ein Swap dort.
+    let run = |match_q: &str| -> Result<Vec<EnvelopeSummary>, DbError> {
+        let mut stmt = conn.prepare(&sql)?;
+        let bind_refs: Vec<&dyn ToSql> = if use_fts {
+            let mut v: Vec<&dyn ToSql> = Vec::with_capacity(binds.len());
+            v.push(&match_q as &dyn ToSql);
+            v.extend(binds[1..].iter().map(|b| b.as_ref()));
+            v
+        } else {
+            binds.iter().map(|b| b.as_ref()).collect()
+        };
+        let rows = stmt.query_map(bind_refs.as_slice(), map_envelope_summary)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
+    };
+
+    let mut rows = run(fts_trimmed)?;
+    if use_fts && rows.len() < MIN_HITS_BEFORE_PREFIX_FALLBACK {
+        let expanded = prefix_expand_query(fts_trimmed);
+        if expanded != fts_trimmed {
+            let extra = run(&expanded)?;
+            // Merge: exakte Treffer zuerst (die meinte der User),
+            // Präfix-Treffer dahinter — dedupe per id, Datumssortierung
+            // und Limit wie gehabt.
+            let mut seen: std::collections::HashSet<_> =
+                rows.iter().map(|r| r.id).collect();
+            rows.extend(extra.into_iter().filter(|r| seen.insert(r.id)));
+            rows.sort_by(|a, b| b.date.cmp(&a.date));
+            rows.truncate(limit as usize);
+        }
+    }
+    if use_fts {
+        attach_snippets(conn, &mut rows, fts_trimmed);
+    }
+    Ok(rows)
+}
+
+/// Unter so vielen Treffern lohnt der Präfix-Fallback: die exakte
+/// Tokensuche hat den User offenbar nicht ans Ziel gebracht.
+const MIN_HITS_BEFORE_PREFIX_FALLBACK: usize = 5;
+
+/// Hängt FTS5-Präfix-Wildcards an die Bareword-Tokens einer Query an
+/// („rechnung" → „rechnung*"). Nur echte Freitext-Wörter (≥ 3 Zeichen,
+/// rein alphanumerisch, kein Spalten-Selektor, keine Phrase, kein
+/// Operator, kein schon-präfixiertes Token) werden angefasst —
+/// Phrasen- und Bool-Semantik bleiben unverändert.
+fn prefix_expand_query(fts: &str) -> String {
+    fts.split_whitespace()
+        .map(|tok| {
+            let is_bareword = tok.chars().next().is_some_and(|c| c.is_alphabetic())
+                && tok.chars().all(|c| c.is_alphanumeric() || c == '_')
+                && tok.chars().count() >= 3
+                && !matches!(tok.to_uppercase().as_str(), "AND" | "OR" | "NOT" | "NEAR");
+            if is_bareword {
+                format!("{tok}*")
+            } else {
+                tok.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+// ─── Treffer-Snippets ────────────────────────────────────────────────
+//
+// FTS5 `snippet()`/`highlight()` liefern auf contentless Tabellen
+// (`content=''`) leere Strings — der Dokumenttext ist ja nicht
+// gespeichert. Darum bauen wir den Kontext selbst: aus Betreff und
+// Absender (immer vorhanden) sowie dem gecachten Body, wenn einer da
+// ist. Marker bleiben die `<mark>`-Konvention, damit das Frontend
+// dieselbe Darstellung nutzen kann wie bei einem echten FTS-Snippet.
+
+/// Nur die ersten N Treffer bekommen ein Snippet — jeder Body-Zugriff
+/// ist ein DB-Read, und unterhalb der ersten Bildschirmseite sieht den
+/// Kontext ohnehin kaum jemand.
+const SNIPPET_BUDGET: usize = 25;
+/// Zeichen links/rechts um den ersten Term-Treffer im Body-Fenster.
+const SNIPPET_WINDOW: usize = 45;
+
+fn attach_snippets(conn: &ReadConn, rows: &mut [EnvelopeSummary], fts: &str) {
+    let terms = extract_highlight_terms(fts);
+    if terms.is_empty() {
+        return;
+    }
+    for row in rows.iter_mut().take(SNIPPET_BUDGET) {
+        let body: Option<String> = conn
+            .query_row(
+                "SELECT plain_text FROM bodies WHERE envelope_id = ?1",
+                params![row.id.0.to_string()],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        row.snippet = build_snippet(&row.subject, &row.from_first, body.as_deref(), &terms);
+    }
+}
+
+/// Suchbegriffe fürs Highlighting aus der FTS-Query extrahieren:
+/// Barewords, Phrasen-Inhalte und Spalten-Werte (`from_text:foo` →
+/// „foo"); Operatoren, Negationen und Präfix-Sterne fallen weg.
+fn extract_highlight_terms(fts: &str) -> Vec<String> {
+    fn push_term(raw: &str, terms: &mut Vec<String>) {
+        let t = raw.trim().trim_matches('"');
+        let t = t.strip_prefix('-').unwrap_or(t);
+        // Spalten-Selektor: nur der Wert ist highlight-würdig.
+        let t = match t.find(':') {
+            Some(i) if i > 0 => &t[i + 1..],
+            _ => t,
+        };
+        let t = t.trim_end_matches('*');
+        if t.chars().count() >= 2 && !matches!(t.to_uppercase().as_str(), "AND" | "OR" | "NOT") {
+            terms.push(t.to_lowercase());
+        }
+    }
+
+    let mut terms = Vec::new();
+    let mut current = String::new();
+    let mut in_quote = false;
+    for ch in fts.chars() {
+        match ch {
+            '"' => {
+                in_quote = !in_quote;
+                current.push(ch);
+            }
+            c if c.is_whitespace() && !in_quote => {
+                if !current.is_empty() {
+                    push_term(&current, &mut terms);
+                    current.clear();
+                }
+            }
+            c => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        push_term(&current, &mut terms);
+    }
+    terms
+}
+
+/// Erster Term-Treffer in Betreff, Absender oder Body (in dieser
+/// Reihenfolge) → Fenster mit `<mark>`-Markern. `None`, wenn nichts
+/// davon matcht (z.B. Match nur in `to_text` oder Body nicht gecacht).
+fn build_snippet(
+    subject: &str,
+    from: &str,
+    body: Option<&str>,
+    terms: &[String],
+) -> Option<String> {
+    for text in [Some(subject), Some(from), body].into_iter().flatten() {
+        let lower = text.to_lowercase();
+        let pos = terms.iter().filter_map(|t| lower.find(t)).min();
+        if let Some(pos) = pos {
+            return Some(mark_window(text, pos, terms));
+        }
+    }
+    None
+}
+
+/// Fenster um `pos` schneiden (char-boundary-sicher) und alle
+/// Term-Vorkommen darin markieren.
+fn mark_window(text: &str, pos: usize, terms: &[String]) -> String {
+    let start = floor_boundary(text, pos.saturating_sub(SNIPPET_WINDOW));
+    let end = ceil_boundary(text, (pos + SNIPPET_WINDOW).min(text.len()));
+    let window = &text[start..end];
+    let prefix = if start > 0 { "…" } else { "" };
+    let suffix = if end < text.len() { "…" } else { "" };
+    format!("{prefix}{}{suffix}", mark_terms(window, terms))
+}
+
+fn mark_terms(window: &str, terms: &[String]) -> String {
+    let lower = window.to_lowercase();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < window.len() {
+        // Frühestes Term-Vorkommen ab Position i.
+        let mut next: Option<(usize, usize)> = None;
+        for t in terms {
+            if let Some(rel) = lower.get(i..).and_then(|s| s.find(t)) {
+                let p = i + rel;
+                if next.is_none_or(|(np, _)| p < np) {
+                    next = Some((p, t.len()));
+                }
+            }
+        }
+        match next {
+            None => {
+                out.push_str(&window[i..]);
+                break;
+            }
+            Some((p, len)) => {
+                let end = ceil_boundary(window, p + len);
+                out.push_str(&window[i..p]);
+                out.push_str("<mark>");
+                out.push_str(&window[p..end]);
+                out.push_str("</mark>");
+                i = end;
+            }
+        }
+    }
+    out
+}
+
+fn floor_boundary(s: &str, mut i: usize) -> usize {
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+fn ceil_boundary(s: &str, mut i: usize) -> usize {
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
+/// Integrity probe for the FTS index: how many envelopes lack a row in
+/// `fts_envelopes`. Migration 0002 dropped the FTS table and only the
+/// 30-day sync window re-populated it, so older cached envelopes
+/// silently vanished from search. Startup compares this against 0 and
+/// kicks `WriteCmd::RebuildFtsIndex` when it finds gaps; the
+/// `repair_search_index` command exposes the same check manually.
+pub fn fts_missing_count(conn: &ReadConn) -> Result<i64, DbError> {
+    crate::infrastructure::db_ops::fts_missing_count(conn)
+}
+
+/// Folders that still have older, not-yet-cached envelopes on the
+/// server: sync-enabled, at least one cached envelope (the pivot UID),
+/// and oldest cached UID > 1. Drives the background backfill worker
+/// (`application::backfill`).
+pub fn backfill_candidate_folders(
+    conn: &ReadConn,
+    account_id: &AccountId,
+) -> Result<Vec<FolderId>, DbError> {
+    let mut stmt = conn.prepare(
+        "SELECT f.id
+           FROM folders f
+          WHERE f.account_id = ?1
+            AND f.sync_enabled = 1
+            AND (SELECT MIN(e.imap_uid) FROM envelopes e WHERE e.folder_id = f.id) > 1",
+    )?;
+    let rows = stmt.query_map(params![account_id.0.to_string()], |row| {
+        let id_str: String = row.get(0)?;
+        Ok(FolderId(parse_uuid_rs(&id_str)?))
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
+}
+
+/// Sync-enabled folders with zero cached envelopes. The 30-day sync
+/// window stores nothing for folders whose mail is entirely older, so
+/// the backfill seeds these via `sync_folder_recent` (top-N of ALL
+/// UIDs) to establish the pivot the older-than pager needs.
+pub fn empty_sync_enabled_folders(
+    conn: &ReadConn,
+    account_id: &AccountId,
+) -> Result<Vec<FolderId>, DbError> {
+    let mut stmt = conn.prepare(
+        "SELECT f.id
+           FROM folders f
+          WHERE f.account_id = ?1
+            AND f.sync_enabled = 1
+            AND NOT EXISTS (SELECT 1 FROM envelopes e WHERE e.folder_id = f.id)",
+    )?;
+    let rows = stmt.query_map(params![account_id.0.to_string()], |row| {
+        let id_str: String = row.get(0)?;
+        Ok(FolderId(parse_uuid_rs(&id_str)?))
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
+}
+
+/// Coverage stats for the search UI — how much of the mailbox the
+/// local index currently sees. `incomplete_folders` counts sync-enabled
+/// folders whose oldest cached UID is still > 1, i.e. the server holds
+/// older mail the local FTS index can't see yet. Folders with zero
+/// cached envelopes aren't counted (the backfill seeds them silently).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchCoverage {
+    pub indexed_envelopes: i64,
+    pub oldest_date_utc: Option<String>,
+    pub incomplete_folders: i64,
+}
+
+pub fn search_coverage(conn: &ReadConn) -> Result<SearchCoverage, DbError> {
+    let (count, oldest): (i64, Option<String>) = conn.query_row(
+        "SELECT COUNT(*), MIN(date_utc) FROM envelopes WHERE deleted = 0",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let incomplete: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM (
+             SELECT f.id
+               FROM folders f
+               JOIN envelopes e ON e.folder_id = f.id
+              WHERE f.sync_enabled = 1
+              GROUP BY f.id
+             HAVING MIN(e.imap_uid) > 1
+         )",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(SearchCoverage {
+        indexed_envelopes: count,
+        oldest_date_utc: oldest,
+        incomplete_folders: incomplete,
+    })
+}
+
+/// Summaries for a specific set of IMAP UIDs within one folder. The
+/// server-search path uses this to shape freshly fetched hits into the
+/// same EnvelopeSummary the local FTS search returns, so the frontend
+/// can merge both result sets without a second mapping layer.
+pub fn summaries_by_folder_uids(
+    conn: &ReadConn,
+    folder_id: &FolderId,
+    uids: &[u32],
+) -> Result<Vec<EnvelopeSummary>, DbError> {
+    if uids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = uids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT {ENVELOPE_SUMMARY_COLS}
+           FROM envelopes e
+           JOIN accounts a ON a.id = e.account_id
+          WHERE e.folder_id = ? AND e.imap_uid IN ({placeholders})"
+    );
     let mut stmt = conn.prepare(&sql)?;
+    let mut binds: Vec<Box<dyn ToSql>> = vec![Box::new(folder_id.0.to_string())];
+    for uid in uids {
+        binds.push(Box::new(*uid));
+    }
     let bind_refs: Vec<&dyn ToSql> = binds.iter().map(|b| b.as_ref()).collect();
     let rows = stmt.query_map(bind_refs.as_slice(), map_envelope_summary)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
@@ -1723,6 +2085,9 @@ fn map_envelope_summary(row: &Row<'_>) -> rusqlite::Result<EnvelopeSummary> {
         body_cached: body_cached != 0,
         has_attachments: has_attachments != 0,
         scheduled,
+        // Wird bei FTS-Suchen nachträglich via `attach_snippets`
+        // befüllt — der Row-Mapper bleibt für alle Query-Pfade gleich.
+        snippet: None,
     })
 }
 
@@ -2307,3 +2672,175 @@ fn map_contact_email(row: &Row<'_>) -> rusqlite::Result<crate::domain::contact::
     })
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::message::{Address, Envelope, Flags};
+    use r2d2::Pool;
+
+    /// Volles Produktiv-Schema in-memory über einen 1-Verbindungs-Pool —
+    //  damit testen wir die öffentliche ReadConn-Signatur statt einer
+    //  Sonderbehandlung für &Connection.
+    fn test_conn() -> ReadConn {
+        let manager = SqliteConnectionManager::memory();
+        let pool = Pool::builder().max_size(1).build(manager).unwrap();
+        let mut conn = pool.get().unwrap();
+        crate::infrastructure::migrations::apply(&mut conn).unwrap();
+        conn
+    }
+
+    fn seed_account_and_folder(conn: &ReadConn) -> (AccountId, FolderId) {
+        let account_id = AccountId(Uuid::new_v4());
+        conn.execute(
+            "INSERT INTO accounts (id, display_name, address, from_name, color,
+                 imap_host, imap_port, imap_tls, smtp_host, smtp_port, smtp_tls,
+                 credential_kind, credential_entry, archive_folder, created_at)
+             VALUES (?1, 'Test', 'user@example.com', 'User', '#000000',
+                 'imap.example.com', 993, 1, 'smtp.example.com', 465, 1,
+                 'password', 'keyring-entry', 'Archive', '2024-01-01T00:00:00Z')",
+            params![account_id.0.to_string()],
+        )
+        .unwrap();
+        let folder_id = crate::infrastructure::db_ops::ensure_folder(conn, &account_id, "INBOX").unwrap();
+        (account_id, folder_id)
+    }
+
+    fn envelope(
+        account_id: &AccountId,
+        folder_id: &FolderId,
+        uid: u32,
+        subject: &str,
+    ) -> Envelope {
+        Envelope {
+            id: MessageId(Uuid::new_v4()),
+            account_id: AccountId(account_id.0),
+            folder_id: FolderId(folder_id.0),
+            imap_uid: uid,
+            message_id_header: None,
+            from: vec![Address {
+                name: Some("Kunde".into()),
+                email: "kunde@example.com".into(),
+            }],
+            to: vec![],
+            cc: vec![],
+            subject: subject.to_string(),
+            date: Utc::now(),
+            flags: Flags::default(),
+            references: vec![],
+            size_bytes: 1000,
+            body_cached: false,
+            has_attachments: false,
+        }
+    }
+
+    #[test]
+    fn prefix_expansion_touches_only_barewords() {
+        assert_eq!(prefix_expand_query("rechnung"), "rechnung*");
+        // Zahlen sind keine Barewords (erstes Zeichen nicht alphabetisch)
+        // und bleiben unverändert.
+        assert_eq!(
+            prefix_expand_query("rechnung april 2024"),
+            "rechnung* april* 2024"
+        );
+        // Operatoren, Selektoren, Phrasen, Negation, Kurzwörter und
+        // bereits präfixierte Tokens bleiben unangetastet.
+        assert_eq!(
+            prefix_expand_query("rechnung OR mahnung"),
+            "rechnung* OR mahnung*"
+        );
+        assert_eq!(prefix_expand_query("from_text:mel re"), "from_text:mel re");
+        assert_eq!(
+            prefix_expand_query("\"genaue phrase\" okay"),
+            "\"genaue phrase\" okay*"
+        );
+        assert_eq!(prefix_expand_query("-newsletter foo"), "-newsletter foo*");
+        assert_eq!(prefix_expand_query("ab"), "ab");
+    }
+
+    #[test]
+    fn highlight_terms_skip_operators_and_selectors() {
+        let terms = extract_highlight_terms("rechnung from_text:melchinger -newsletter \"genaue phrase\" OR");
+        assert_eq!(
+            terms,
+            vec!["rechnung", "melchinger", "newsletter", "genaue phrase"]
+        );
+    }
+
+    #[test]
+    fn snippet_prefers_subject_then_marks_terms() {
+        let s = build_snippet(
+            "Ihre Rechnungen vom April",
+            "Kunde <kunde@example.com>",
+            None,
+            &["rechnung".to_string()],
+        )
+        .unwrap();
+        assert!(s.contains("<mark>Rechnung</mark>en"), "snippet: {s}");
+        // Kein Treffer in subject/from und kein Body → kein Snippet.
+        assert!(build_snippet("Hallo", "Kunde", None, &["xyz".to_string()]).is_none());
+    }
+
+    #[test]
+    fn snippet_windows_body_hits() {
+        let body = "Sehr geehrte Damen und Herren, anbei erhalten Sie die Rechnung für den Monat April mit freundlichen Grüßen";
+        let s = build_snippet("Vorgang", "Kunde", Some(body), &["april".to_string()]).unwrap();
+        assert!(s.contains("<mark>April</mark>"), "snippet: {s}");
+        assert!(s.starts_with('…'), "window should be clipped left: {s}");
+    }
+
+    #[test]
+    fn search_advanced_prefix_fallback_finds_plural_with_snippet() {
+        let mut conn = test_conn();
+        let (account_id, folder_id) = seed_account_and_folder(&conn);
+        let env = envelope(&account_id, &folder_id, 1, "Ihre Rechnungen vom April");
+        crate::infrastructure::db_ops::upsert_envelope(&mut conn, &env, None).unwrap();
+
+        // Exakt-Token „rechnung" matcht „rechnungen" nicht — ohne
+        // Fallback wäre das ein stiller Miss.
+        let rows = search_advanced(
+            &conn,
+            "rechnung",
+            None,
+            None,
+            None,
+            &SearchFilters::default(),
+            50,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1, "prefix fallback should find the plural");
+        let snippet = rows[0].snippet.as_deref().unwrap_or("");
+        assert!(snippet.contains("<mark>Rechnung</mark>"), "snippet: {snippet}");
+    }
+
+    #[test]
+    fn search_advanced_snippet_comes_from_cached_body() {
+        let mut conn = test_conn();
+        let (account_id, folder_id) = seed_account_and_folder(&conn);
+        let env = envelope(&account_id, &folder_id, 1, "Vorgang 4711");
+        crate::infrastructure::db_ops::upsert_envelope(&mut conn, &env, None).unwrap();
+        crate::infrastructure::db_ops::store_body(
+            &mut conn,
+            &env.id,
+            b"raw",
+            Some("Anbei die Rechnung für den Monat April."),
+            None,
+            false,
+        )
+        .unwrap();
+
+        let rows = search_advanced(
+            &conn,
+            "april",
+            None,
+            None,
+            None,
+            &SearchFilters::default(),
+            50,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        let snippet = rows[0].snippet.as_deref().unwrap_or("");
+        assert!(snippet.contains("<mark>April</mark>"), "snippet: {snippet}");
+    }
+}

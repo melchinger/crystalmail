@@ -56,6 +56,7 @@ import type {
   EnvelopeSummary,
   MessageDetail,
   PreparedImportDraft,
+  SearchCoverage,
   SyncProgress,
   SyncReport,
   UnifiedUnreadCount,
@@ -151,6 +152,21 @@ const AUTO_SYNC_COOLDOWN_MS = 90_000;
 const PAGE_SIZE_INITIAL = 100;
 const PAGE_SIZE_STEP = 100;
 const PAGE_SIZE_SEARCH = 500;
+
+/**
+ * Merge server-search hits into the locally-found rows: dedupe by id
+ * (a hit can already be cached locally), sort newest-first like every
+ * other list in the app, cap at the search page size.
+ */
+function mergeServerHits(
+  local: EnvelopeSummary[],
+  server: EnvelopeSummary[],
+): EnvelopeSummary[] {
+  const seen = new Set(local.map((r) => r.id));
+  const merged = [...local, ...server.filter((r) => !seen.has(r.id))];
+  merged.sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
+  return merged.slice(0, PAGE_SIZE_SEARCH);
+}
 const SYNC_OLDER_BATCH = 50;
 
 export function App() {
@@ -414,6 +430,11 @@ export function App() {
   // session, resets when the active folder changes (along with the
   // input itself).
   const [searchAllFolders, setSearchAllFolders] = useState(false);
+  // Hybrid search state: coverage of the local index (drives the
+  // status line under the search box) + whether the IMAP server leg
+  // is still in flight.
+  const [searchCoverage, setSearchCoverage] = useState<SearchCoverage | null>(null);
+  const [serverSearching, setServerSearching] = useState(false);
 
   useEffect(() => {
     const trimmed = searchInput.trim();
@@ -432,7 +453,92 @@ export function App() {
     setSearchQuery("");
     setSearchError(null);
     setSearchAllFolders(false);
+    setSearchCoverage(null);
   }, [activeFolder]);
+
+  // Hybrid search, server leg. The local FTS index only covers cached
+  // mail (30-day window + backfill progress), so every real query also
+  // goes to the IMAP server(s): `UID SEARCH` there is indexed and fast
+  // even over huge archives. Hits are persisted by the backend (which
+  // grows the local index for next time) and merged into the list
+  // here. Coverage stats ride along for the status line.
+  useEffect(() => {
+    if (
+      !searchQuery ||
+      activeFolder === "calendar" ||
+      activeFolder === "contacts"
+    ) {
+      setServerSearching(false);
+      return;
+    }
+    let cancelled = false;
+    const parsed = parseSearchQuery(searchQuery);
+    const folderKey = activeFolder === "unified" ? "inbox" : activeFolder;
+    // Mirror fetchInboxFor's routing: explicit `in:` wins; otherwise a
+    // pinned sub-folder scopes via folderId, the all-folders toggle
+    // drops folder scope entirely.
+    const useFolderId =
+      selectedFolder != null && parsed.folderOverride == null && !searchAllFolders;
+    const folderForSearch =
+      parsed.folderOverride ??
+      (searchAllFolders || selectedFolder != null ? null : folderKey);
+
+    void invoke<SearchCoverage>("search_coverage")
+      .then((c) => {
+        if (!cancelled) setSearchCoverage(c);
+      })
+      .catch(() => {});
+
+    setServerSearching(true);
+    void invoke<EnvelopeSummary[]>("search_server", {
+      fts: parsed.fts,
+      folder: folderForSearch,
+      folderId: useFolderId ? selectedFolder.folderId : null,
+      accountId: accountFilter,
+      filters: parsed.filters,
+      limit: 100,
+    })
+      .then((rows) => {
+        if (cancelled || rows.length === 0) return;
+        setInbox((current) => mergeServerHits(current, rows));
+        // Server hits just enriched the local index — refresh coverage.
+        void invoke<SearchCoverage>("search_coverage")
+          .then((c) => {
+            if (!cancelled) setSearchCoverage(c);
+          })
+          .catch(() => {});
+      })
+      .catch((e) => console.warn("[crystalmail] server search failed:", e))
+      .finally(() => {
+        if (!cancelled) setServerSearching(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [searchQuery, activeFolder, selectedFolder, searchAllFolders, accountFilter]);
+
+  // Live coverage refresh while the backfill worker extends the local
+  // index — only worth hitting the DB when a search is on screen.
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    let cancelled = false;
+    void listen("backfill-changed", () => {
+      if (!searchQuery) return;
+      void invoke<SearchCoverage>("search_coverage")
+        .then((c) => {
+          if (!cancelled) setSearchCoverage(c);
+        })
+        .catch(() => {});
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [searchQuery]);
 
   const syncInFlight = useRef(false);
   /// Timestamp (ms) of the last completed sync, used by the folder-switch
@@ -1388,6 +1494,18 @@ export function App() {
       rows: EnvelopeSummary[];
       searchError: string | null;
     } | null> => {
+      // Calendar/Contacts are client-side-derived pseudo-views with no
+      // IMAP folder behind them. Bail out before touching the backend:
+      // returning null tells `refresh` to keep the current mail list in
+      // state (there's nothing to fetch here) and — crucially — avoids
+      // handing the pseudo-key to `list_unified_folder`/`search_advanced`,
+      // which reject it with "unknown folder key: calendar". This path is
+      // hit whenever a sync/refresh fires while the calendar view is open
+      // — e.g. right after "Termin aus Mail anlegen" switches the view.
+      if (activeFolder === "calendar" || activeFolder === "contacts") {
+        return null;
+      }
+
       const folderKey = activeFolder === "unified" ? "inbox" : activeFolder;
       try {
         // Ad-hoc sub-folder pinned: search and listing both go through
@@ -1658,6 +1776,10 @@ export function App() {
     // chronological window. Pulling older from IMAP wouldn't add to
     // the visible result set without re-running FTS.
     if (searchQuery.length > 0) return;
+    // Non-mail pseudo-views have no IMAP folder to page — skip entirely
+    // so phase 2 never hands "calendar"/"contacts" to
+    // `sync_unified_folder_older` (→ "unknown folder key").
+    if (activeFolder === "calendar" || activeFolder === "contacts") return;
     if (exhaustedRef.current === viewKey) return;
     loadingOlderRef.current = true;
     void (async () => {
@@ -1802,13 +1924,29 @@ export function App() {
           return null;
       }
     };
+    // Account-filter active ⇒ sync only that account. The manual sync
+    // then mirrors what the user is actually looking at instead of
+    // fanning out across every configured account.
+    const targets = accountFilter
+      ? accounts.filter((a) => a.id === accountFilter)
+      : accounts;
+
+    // Folder-scoped sync: when filtered to one account *and* sitting in
+    // a concrete server folder (Sent, Archive, …), pull just that
+    // folder and stop — don't drag the account's other specials along.
+    // The unified inbox stays a full-account sync, since INBOX is the
+    // primary view people expect a complete refresh in.
+    const FOLDER_SCOPED_VIEWS = ["sent", "archive", "drafts", "trash", "spam"];
+    const onlyPriority =
+      accountFilter !== null && FOLDER_SCOPED_VIEWS.includes(activeFolder);
     try {
-      for (const a of accounts) {
+      for (const a of targets) {
         setStatus(t("sync.perAccount", { name: a.displayName }));
         try {
           const r = await invoke<SyncReport>("sync_account", {
             accountId: a.id,
             priorityFolder: priorityFor(a),
+            onlyPriority,
           });
           total += r.stored;
           totalMs += r.durationMs;
@@ -1827,7 +1965,7 @@ export function App() {
       setSyncing(false);
       syncInFlight.current = false;
     }
-  }, [accounts, activeFolder, t, refresh]);
+  }, [accounts, accountFilter, activeFolder, t, refresh]);
 
   // Keep the ref pointing at the latest syncAll so the hotkey hook (which
   // captured callbacks on mount) can always invoke the current version.
@@ -2092,6 +2230,8 @@ export function App() {
               }}
               searchError={searchError}
               searching={searchInput.trim() !== searchQuery}
+              searchCoverage={searchCoverage}
+              serverSearching={serverSearching}
               junkBadgeTone={inSpamView ? "confirmed" : "candidate"}
               embedded
               onNearBottom={loadMoreOlder}

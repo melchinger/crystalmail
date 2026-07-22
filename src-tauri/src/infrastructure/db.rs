@@ -98,6 +98,14 @@ pub enum WriteCmd {
         /// envelopes that fall inside the SINCE-30d window.
         ack: oneshot::Sender<Result<bool, DbError>>,
     },
+    /// Re-insert missing FTS5 rows for envelopes that lost theirs
+    /// (migration 0002 dropped the table; only the 30-day sync window
+    /// re-populated it, so older cached envelopes silently vanished
+    /// from search). Existing FTS rows stay untouched. Ack carries the
+    /// number of rows inserted.
+    RebuildFtsIndex {
+        ack: oneshot::Sender<Result<usize, DbError>>,
+    },
     UpdateFlags {
         message_id: MessageId,
         flags: Flags,
@@ -696,6 +704,9 @@ fn dispatch(conn: &mut Connection, cmd: WriteCmd) {
             ack,
         } => {
             let _ = ack.send(upsert_envelope(conn, &envelope, body_text.as_deref()));
+        }
+        WriteCmd::RebuildFtsIndex { ack } => {
+            let _ = ack.send(rebuild_fts_index(conn));
         }
         WriteCmd::UpdateFlags {
             message_id,

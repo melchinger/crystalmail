@@ -1,6 +1,7 @@
 // Application layer: orchestration between domain and infrastructure.
 pub mod actor;
 pub mod attachments;
+pub mod backfill;
 pub mod backup;
 pub mod body;
 pub mod body_essentials;
@@ -15,6 +16,7 @@ pub mod message_ops;
 pub mod mark_read;
 pub mod prefetch;
 pub mod rule_scheduler;
+pub mod server_search;
 pub mod smtp;
 pub mod spam_analysis;
 pub mod spam_rules;

@@ -18,8 +18,10 @@ export const SUBSCRIPTION_PALETTE = [
 /**
  * Color CSS value to use for one event's bar / pill in the calendar
  * views. Subscribed events use their subscription's `color`; everything
- * else (manual, ICS-imports, negotiations) falls back to the app's
- * accent variable so light/dark theme switching still works.
+ * else (manual, ICS-imports, negotiations) uses the configured
+ * local-calendar `localColor`. When `localColor` is omitted (older
+ * callers / config not yet loaded) it falls back to the app's accent
+ * variable so light/dark theme switching still works.
  *
  * Pass the subscription map pre-keyed by id so this stays O(1) per call
  * — the caller does the `new Map(subs.map(s => [s.id, s]))` build once.
@@ -27,12 +29,13 @@ export const SUBSCRIPTION_PALETTE = [
 export function eventColor(
   ev: { subscriptionId: string | null },
   subscriptionsById: ReadonlyMap<string, { color: string }>,
+  localColor?: string,
 ): string {
   if (ev.subscriptionId) {
     const sub = subscriptionsById.get(ev.subscriptionId);
     if (sub) return sub.color;
   }
-  return "var(--accent)";
+  return localColor ?? "var(--accent)";
 }
 
 // Display-time heuristics for calendar events. Phase 1 doesn't carry an
