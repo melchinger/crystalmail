@@ -56,6 +56,7 @@ import type {
   EnvelopeSummary,
   MessageDetail,
   PreparedImportDraft,
+  SearchCoverage,
   SyncProgress,
   SyncReport,
   UnifiedUnreadCount,
@@ -151,6 +152,21 @@ const AUTO_SYNC_COOLDOWN_MS = 90_000;
 const PAGE_SIZE_INITIAL = 100;
 const PAGE_SIZE_STEP = 100;
 const PAGE_SIZE_SEARCH = 500;
+
+/**
+ * Merge server-search hits into the locally-found rows: dedupe by id
+ * (a hit can already be cached locally), sort newest-first like every
+ * other list in the app, cap at the search page size.
+ */
+function mergeServerHits(
+  local: EnvelopeSummary[],
+  server: EnvelopeSummary[],
+): EnvelopeSummary[] {
+  const seen = new Set(local.map((r) => r.id));
+  const merged = [...local, ...server.filter((r) => !seen.has(r.id))];
+  merged.sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
+  return merged.slice(0, PAGE_SIZE_SEARCH);
+}
 const SYNC_OLDER_BATCH = 50;
 
 export function App() {
@@ -414,6 +430,11 @@ export function App() {
   // session, resets when the active folder changes (along with the
   // input itself).
   const [searchAllFolders, setSearchAllFolders] = useState(false);
+  // Hybrid search state: coverage of the local index (drives the
+  // status line under the search box) + whether the IMAP server leg
+  // is still in flight.
+  const [searchCoverage, setSearchCoverage] = useState<SearchCoverage | null>(null);
+  const [serverSearching, setServerSearching] = useState(false);
 
   useEffect(() => {
     const trimmed = searchInput.trim();
@@ -432,7 +453,92 @@ export function App() {
     setSearchQuery("");
     setSearchError(null);
     setSearchAllFolders(false);
+    setSearchCoverage(null);
   }, [activeFolder]);
+
+  // Hybrid search, server leg. The local FTS index only covers cached
+  // mail (30-day window + backfill progress), so every real query also
+  // goes to the IMAP server(s): `UID SEARCH` there is indexed and fast
+  // even over huge archives. Hits are persisted by the backend (which
+  // grows the local index for next time) and merged into the list
+  // here. Coverage stats ride along for the status line.
+  useEffect(() => {
+    if (
+      !searchQuery ||
+      activeFolder === "calendar" ||
+      activeFolder === "contacts"
+    ) {
+      setServerSearching(false);
+      return;
+    }
+    let cancelled = false;
+    const parsed = parseSearchQuery(searchQuery);
+    const folderKey = activeFolder === "unified" ? "inbox" : activeFolder;
+    // Mirror fetchInboxFor's routing: explicit `in:` wins; otherwise a
+    // pinned sub-folder scopes via folderId, the all-folders toggle
+    // drops folder scope entirely.
+    const useFolderId =
+      selectedFolder != null && parsed.folderOverride == null && !searchAllFolders;
+    const folderForSearch =
+      parsed.folderOverride ??
+      (searchAllFolders || selectedFolder != null ? null : folderKey);
+
+    void invoke<SearchCoverage>("search_coverage")
+      .then((c) => {
+        if (!cancelled) setSearchCoverage(c);
+      })
+      .catch(() => {});
+
+    setServerSearching(true);
+    void invoke<EnvelopeSummary[]>("search_server", {
+      fts: parsed.fts,
+      folder: folderForSearch,
+      folderId: useFolderId ? selectedFolder.folderId : null,
+      accountId: accountFilter,
+      filters: parsed.filters,
+      limit: 100,
+    })
+      .then((rows) => {
+        if (cancelled || rows.length === 0) return;
+        setInbox((current) => mergeServerHits(current, rows));
+        // Server hits just enriched the local index — refresh coverage.
+        void invoke<SearchCoverage>("search_coverage")
+          .then((c) => {
+            if (!cancelled) setSearchCoverage(c);
+          })
+          .catch(() => {});
+      })
+      .catch((e) => console.warn("[crystalmail] server search failed:", e))
+      .finally(() => {
+        if (!cancelled) setServerSearching(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [searchQuery, activeFolder, selectedFolder, searchAllFolders, accountFilter]);
+
+  // Live coverage refresh while the backfill worker extends the local
+  // index — only worth hitting the DB when a search is on screen.
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    let cancelled = false;
+    void listen("backfill-changed", () => {
+      if (!searchQuery) return;
+      void invoke<SearchCoverage>("search_coverage")
+        .then((c) => {
+          if (!cancelled) setSearchCoverage(c);
+        })
+        .catch(() => {});
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [searchQuery]);
 
   const syncInFlight = useRef(false);
   /// Timestamp (ms) of the last completed sync, used by the folder-switch
@@ -2124,6 +2230,8 @@ export function App() {
               }}
               searchError={searchError}
               searching={searchInput.trim() !== searchQuery}
+              searchCoverage={searchCoverage}
+              serverSearching={serverSearching}
               junkBadgeTone={inSpamView ? "confirmed" : "candidate"}
               embedded
               onNearBottom={loadMoreOlder}

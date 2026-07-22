@@ -2,7 +2,10 @@
 param(
     [string]$SourceExe,
     [switch]$Build,
-    [string]$BuildCommand = "npm run tauri -- build --bundles app",
+    # Nur die exe bauen (kein msi/nsis-Installer) - das Skript kopiert
+    # sowieso die rohe exe aus target/release, das Bundling waere
+    # verschwendete Zeit.
+    [string]$BuildCommand = "npm run tauri -- build --no-bundle",
     [string]$WorkspaceRoot
 )
 
@@ -65,6 +68,33 @@ function Resolve-WorkspaceRoot {
 $repoRoot = Resolve-WorkspaceRoot -ExplicitWorkspaceRoot $WorkspaceRoot -ScriptPath $MyInvocation.MyCommand.Path
 $productName = "CrystalMail"
 $installedExeName = "crystalmail.exe"
+
+# Soll-Version: tauri.conf.json ist die Source of Truth - sie treibt
+# Bundle-Metadaten und (via tauri-build) die FileVersion der exe.
+# Damit nie ein veralteter Build aus target/release installiert wird,
+# gleichen wir die gefundene Quell-exe dagegen und bauen bei
+# Abweichung automatisch neu.
+function Get-ExpectedVersion {
+    param([string]$Root)
+
+    $confPath = Join-Path $Root "src-tauri\tauri.conf.json"
+    $conf = Get-Content -LiteralPath $confPath -Raw | ConvertFrom-Json
+    if (-not $conf.version) {
+        throw "Keine 'version' in $confPath gefunden."
+    }
+    return $conf.version.Trim()
+}
+
+# exe-FileVersion ist vierstellig ("0.6.0.0"), die Repo-Version
+# dreistellig ("0.6.0") - fuer den Vergleich normalisieren.
+function ConvertTo-NormalizedVersion {
+    param([string]$Version)
+
+    if (-not $Version) { return $null }
+    $v = $Version.Trim()
+    if ($v -match '^(\d+\.\d+\.\d+)\.0$') { return $Matches[1] }
+    return $v
+}
 $defaultSourceCandidates = @(
     (Join-Path $repoRoot "src-tauri\target\release\CrystalMail.exe"),
     (Join-Path $repoRoot "target\release\CrystalMail.exe")
@@ -198,14 +228,43 @@ function Stop-InstalledProcess {
     }
 }
 
-if ($Build) {
-    Invoke-LocalBuild -Command $BuildCommand -WorkingDirectory $repoRoot
+$expectedVersion = Get-ExpectedVersion -Root $repoRoot
+
+# Quell-exe suchen (bei -SourceExe explizit, sonst die Standardpfade).
+# Fehlt sie, wird weiter unten gebaut.
+$sourceExePath = $null
+$sourceVersion = $null
+# Vorsicht mit PowerShell-Praezedenz: `-or` bindet STAERKER als die
+# Pipeline, `$a -or $b | Where {...}` wuerde als `($a -or $b) | Where {...}`
+# geparst und der Kandidaten-Check liefe ins Leere. Darum die
+# Existenzpruefung explizit in eine eigene Variable ziehen.
+$existingCandidates = @($defaultSourceCandidates | Where-Object { Test-Path -LiteralPath $_ })
+if ($SourceExe -or $existingCandidates.Count -gt 0) {
+    $sourceExePath = Resolve-SourceExe -ExplicitPath $SourceExe -CandidatePaths $defaultSourceCandidates
+    $sourceVersion = ConvertTo-NormalizedVersion -Version (Get-Item -LiteralPath $sourceExePath).VersionInfo.FileVersion
 }
 
-$sourceExePath = Resolve-SourceExe -ExplicitPath $SourceExe -CandidatePaths $defaultSourceCandidates
+# Build-Entscheidung: explizit erzwungen (-Build), keine exe da, oder
+# die gefundene exe passt nicht zur Repo-Version (veralteter Build).
+$needsBuild = $Build -or (-not $sourceExePath) -or ($sourceVersion -ne $expectedVersion)
+if ($needsBuild -and -not $Build) {
+    if (-not $sourceExePath) {
+        Write-Host "Keine kompilierte exe gefunden - baue Version $expectedVersion."
+    } else {
+        Write-Host "Gefundene exe ist $sourceVersion, Repo ist $expectedVersion - baue neu."
+    }
+}
+if ($needsBuild) {
+    Invoke-LocalBuild -Command $BuildCommand -WorkingDirectory $repoRoot
+    $sourceExePath = Resolve-SourceExe -ExplicitPath $SourceExe -CandidatePaths $defaultSourceCandidates
+    $sourceVersion = ConvertTo-NormalizedVersion -Version (Get-Item -LiteralPath $sourceExePath).VersionInfo.FileVersion
+    if ($sourceVersion -ne $expectedVersion) {
+        throw "Build lieferte $sourceVersion, erwartet war $expectedVersion. Laufen package.json / tauri.conf.json / Cargo.toml auseinander?"
+    }
+}
+
 $installedExePath = Resolve-InstalledExe -Name $productName -ExeName $installedExeName
 
-$sourceVersion = (Get-Item -LiteralPath $sourceExePath).VersionInfo.FileVersion
 $targetVersionBefore = (Get-Item -LiteralPath $installedExePath).VersionInfo.FileVersion
 
 Write-Host "Quelle : $sourceExePath ($sourceVersion)"

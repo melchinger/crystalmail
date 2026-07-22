@@ -222,6 +222,10 @@ pub struct AppState {
     /// Prevents the same account from spawning two parallel IMAP sessions
     /// when the worker is triggered both from sync and from the frontend.
     pub prefetch_running: std::sync::Mutex<HashSet<AccountId>>,
+    /// Account IDs whose background backfill worker is currently pulling
+    /// older envelopes (30-day window → full history). Same de-dupe
+    /// rationale as `prefetch_running`.
+    pub backfill_running: std::sync::Mutex<HashSet<AccountId>>,
     /// Cancel-tokens for in-flight `open_message` body fetches, keyed by
     /// message id. Archive/delete/move fire the matching token before
     /// starting their own IMAP op so the fetch drops its session early
@@ -299,6 +303,7 @@ impl Default for AppState {
             pi_rpc: Mutex::new(None),
             db: OnceCell::new(),
             prefetch_running: std::sync::Mutex::new(HashSet::new()),
+            backfill_running: std::sync::Mutex::new(HashSet::new()),
             pending_fetch_cancels: std::sync::Mutex::new(HashMap::new()),
             active_spam_pi: Mutex::new(None),
             spam_cancel_requested: AtomicBool::new(false),

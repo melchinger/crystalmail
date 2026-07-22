@@ -504,7 +504,11 @@
     "tipSince": "Seit 1. Januar 2025",
     "tipBefore": "Vor dem 31. Dezember 2025",
     "tipLastWeek": "Letzte Woche",
-    "tipIsFlagged": "Markierte Mails"
+    "tipIsFlagged": "Markierte Mails",
+    "tipMonth": "Betreff + Monat (findet die April-Rechnung)",
+    "serverSearching": "Durchsuche zusätzlich den Server …",
+    "coverageComplete": "Lokaler Index vollständig: {{count}} Mails durchsuchbar.",
+    "coveragePartial": "Lokal indiziert: {{count}} Mails seit {{date}} — ältere werden im Hintergrund nachgeladen."
   },
   "accounts": {
     "heading": "Konten",

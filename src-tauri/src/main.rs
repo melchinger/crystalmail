@@ -177,8 +177,49 @@ fn main() {
                         tracing::warn!(error = %e, "actor: startup-spawn fehlgeschlagen");
                     }
                 }
+                // FTS-Self-Healing: Migration 0002 hat `fts_envelopes`
+                // gedroppt, aber nur das 30-Tage-Sync-Fenster hat den
+                // Index wieder befüllt — ältere gecachte Envelopes
+                // fehlen seitdem still in der Suche. Die Probe zählt
+                // die Lücke, der Writer rekonstruiert fehlende Zeilen
+                // aus envelopes + bodies (bestehende bleiben unangetastet).
+                if let Some(db) = state.db.get().cloned() {
+                    if let Ok(conn) = db.reads.get() {
+                        match infrastructure::queries::fts_missing_count(&conn) {
+                            Ok(0) => {}
+                            Ok(missing) => {
+                                tracing::info!(missing, "fts index incomplete — rebuilding");
+                                let (tx, rx) = tokio::sync::oneshot::channel();
+                                let send = db
+                                    .writer
+                                    .send(infrastructure::db::WriteCmd::RebuildFtsIndex { ack: tx })
+                                    .await;
+                                if send.is_err() {
+                                    tracing::warn!("fts rebuild: writer channel closed");
+                                } else {
+                                    match rx.await {
+                                        Ok(Ok(n)) => {
+                                            tracing::info!(inserted = n, "fts rebuild complete")
+                                        }
+                                        Ok(Err(e)) => {
+                                            tracing::warn!(error = %e, "fts rebuild failed")
+                                        }
+                                        Err(_) => {
+                                            tracing::warn!("fts rebuild: writer dropped ack")
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => tracing::warn!(error = %e, "fts integrity probe failed"),
+                        }
+                    }
+                }
                 // Body-Prefetch wie bisher.
-                application::prefetch::spawn_for_all_accounts(handle).await;
+                application::prefetch::spawn_for_all_accounts(handle.clone()).await;
+                // Envelope-Backfill: das 30-Tage-Sync-Fenster schritt-
+                // weise bis UID 1 ergänzen, damit die Suche auch das
+                // Archiv abdeckt (resumable, Guard deduped pro Konto).
+                application::backfill::spawn_for_all_accounts(handle).await;
             });
 
             // Hydrate pi config from disk if the user saved one previously.
@@ -307,6 +348,9 @@ fn main() {
             commands::mail::search_mail,
             commands::mail::search_in_folder,
             commands::mail::search_advanced,
+            commands::mail::search_server,
+            commands::mail::search_coverage,
+            commands::mail::repair_search_index,
             commands::mail::sync_account,
             commands::mail::sync_folder_recent,
             commands::mail::sync_folder_older,

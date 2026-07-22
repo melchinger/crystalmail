@@ -291,6 +291,7 @@ const TIPS: Array<{
       { example: "since:2025-01-01", labelKey: "search.tipSince" },
       { example: "before:2025-12-31", labelKey: "search.tipBefore" },
       { example: "last week", labelKey: "search.tipLastWeek" },
+      { example: "rechnung april", labelKey: "search.tipMonth" },
       { example: "is:flagged", labelKey: "search.tipIsFlagged" },
     ],
   },

@@ -65,6 +65,20 @@ export type EnvelopeSummary = {
    *  Frontend rendert daraus den Auto-Rule-Marker mit Hover-Tooltip
    *  ("Aktion fällig in 4 Tagen → Archiv durch Regel 'Newsletter'"). */
   scheduled: ScheduledActionTag | null;
+  /** Trefferkontext mit `<mark>`-Markern — nur bei FTS-Suchen gesetzt
+   *  (Backend baut ihn aus Betreff/Absender/gecachetem Body). Wird in
+   *  der InboxList als sichere React-Knoten gerendert, nie als HTML. */
+  snippet?: string | null;
+};
+
+/** Coverage-Status des lokalen Suchindex (Command `search_coverage`).
+ *  Treibt die Statuszeile unter dem Suchfeld: wie weit der lokale
+ *  Index zurückreicht und ob der Backfill-Worker noch läuft. */
+export type SearchCoverage = {
+  indexedEnvelopes: number;
+  oldestDateUtc: string | null;
+  incompleteFolders: number;
+  backfillRunning: boolean;
 };
 
 // ─── Workflow-Rule Scheduling ───────────────────────────────────────

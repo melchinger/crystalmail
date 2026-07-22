@@ -21,6 +21,10 @@
 //                         them into unrelated barewords
 //   today | yesterday | last week | this week | this month | this year
 //                       — relative time phrases, parsed without prefix
+//   rechnung april      — a bare month name becomes a date window for
+//   rechnung april 2024   the month's most recent occurrence (optional
+//                         adjacent year pins it); the remaining words
+//                         stay FTS free text
 //
 // Recognised operators:
 //   from:    → FTS5 column `from_text:` (re-aliased)
@@ -448,6 +452,47 @@ export function parseSearchQuery(input: string): ParsedQuery {
         if (range.before) filters.before = range.before;
         working = working.replace(re, " ");
       }
+    }
+  }
+
+  // Month-name scan: "Rechnung April" should find the invoice *from*
+  // April, not only mails that happen to contain the word "april". A
+  // bare month token becomes a since/before window for the most recent
+  // occurrence of that month; an adjacent 4-digit year pins it
+  // ("April 2024" / "2024 April"). Explicit date operators and the
+  // relative phrases above win — the month scan only runs when no
+  // boundary is set yet.
+  if (filters.since === undefined && filters.before === undefined) {
+    const tokens = tokenise(working);
+    for (let i = 0; i < tokens.length; i++) {
+      const month = MONTH_NAMES[tokens[i].toLowerCase()];
+      if (month === undefined) continue;
+      let year: number | null = null;
+      let yearIdx = -1;
+      for (const j of [i - 1, i + 1]) {
+        if (j >= 0 && j < tokens.length && /^\d{4}$/.test(tokens[j])) {
+          year = Number(tokens[j]);
+          yearIdx = j;
+          break;
+        }
+      }
+      const now = new Date();
+      if (year === null) {
+        year = now.getFullYear();
+        // Month still ahead this year ⇒ the user means last year's.
+        if (month > now.getMonth()) year -= 1;
+      }
+      filters.since = new Date(year, month, 1).toISOString();
+      filters.before = new Date(year, month + 1, 1).toISOString();
+      // Strip month (+year) from the FTS part. Exception: when the
+      // month is the only meaningful token, keep it as free text too
+      // — "April" alone then means "April mails mentioning april",
+      // which is safer than interpreting it as a pure date browse.
+      const remaining = tokens.filter((_, idx) => idx !== i && idx !== yearIdx);
+      if (remaining.length > 0) {
+        working = remaining.join(" ");
+      }
+      break;
     }
   }
 
