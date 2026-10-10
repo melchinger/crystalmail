@@ -34,7 +34,7 @@ use tokio::process::Command;
 
 use crate::domain::message::MessageId;
 use crate::domain::workflow::{
-    BodyFormat, ParamSource, ParameterKind, ScriptParam, Step, Workflow, WorkflowId,
+    BodyFormat, ParamSource, ParameterKind, ScriptParam, Step, ValueType, Workflow, WorkflowId,
 };
 use crate::infrastructure::db::{DbHandle, WriteCmd};
 use crate::infrastructure::queries::{self, EnvelopeDetail};
@@ -1111,6 +1111,20 @@ fn err(idx: u32, kind: &'static str, msg: String) -> StepResult {
     }
 }
 
+fn is_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn is_falsey(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
 /// Build the argv list for a `RunScript` step from its declared
 /// parameters. Mirrors launchpad's `build_command_args`, adapted to
 /// our `ParamSource` enum: `Fixed` takes its value verbatim (after
@@ -1193,17 +1207,51 @@ fn build_argv(params: &[ScriptParam], ctx: &TemplateCtx) -> Result<Vec<String>, 
             }
         };
 
+        // A boolean shown as a Prompt is represented by the run-dialog
+        // checkbox. `false` means "do not pass this parameter", rather
+        // than passing the literal string `false`; this is important for
+        // optional argparse options where presence itself enables a
+        // behaviour. Keep required parameters strict.
+        //
+        // Must stay in sync with the dialog's `isBooleanParam()`
+        // (WorkflowPromptDialog.tsx): a param is boolean either by
+        // declared type, or — for legacy string-typed params — when the
+        // argparse default (`default_value`) or the prompt pre-fill
+        // (`default_template`) is a literal true/false. Both fields are
+        // checked because the settings UI lets users switch a param to
+        // Prompt without carrying over the argparse default.
+        fn is_bool_literal(value: &Option<String>) -> bool {
+            value
+                .as_deref()
+                .map(|d| matches!(d.trim().to_ascii_lowercase().as_str(), "true" | "false"))
+                .unwrap_or(false)
+        }
+        let is_boolean_prompt = match &p.source {
+            ParamSource::Prompt { default_template } => {
+                p.value_type == ValueType::Boolean
+                    || (p.value_type == ValueType::String
+                        && (is_bool_literal(&p.default_value)
+                            || is_bool_literal(default_template)))
+            }
+            _ => false,
+        };
+        if is_boolean_prompt && is_falsey(&value) {
+            if p.required {
+                return Err(format!(
+                    "Pflichtparameter '{}' muss gesetzt werden.",
+                    p.label
+                ));
+            }
+            continue;
+        }
+
         match p.kind {
             ParameterKind::Flag => {
                 // Truthy semantics matching launchpad: only emit the
                 // flag when the value evaluates as "yes". This lets
                 // a flag be driven by a template var (e.g. a custom
                 // one that resolves to "true" conditionally).
-                let truthy = matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                );
-                if truthy {
+                if is_truthy(&value) {
                     argv.push(p.cli_name.clone());
                 }
             }
@@ -1645,6 +1693,93 @@ mod tests {
         )];
         let argv = build_argv(&params, &empty_ctx()).unwrap();
         assert_eq!(argv, vec!["--out", "/tmp/x"]);
+    }
+
+    #[test]
+    fn prompt_boolean_checked_passes_parameter() {
+        let mut ctx = empty_ctx();
+        ctx.prompt_values.insert("enabled".into(), "true".into());
+        let mut param = p(
+            "--enabled",
+            ParameterKind::Option,
+            ParamSource::Prompt {
+                default_template: Some("false".into()),
+            },
+            false,
+            0,
+        );
+        param.value_type = ValueType::Boolean;
+
+        let argv = build_argv(&[param], &ctx).unwrap();
+        assert_eq!(argv, vec!["--enabled", "true"]);
+    }
+
+    #[test]
+    fn prompt_boolean_unchecked_omits_parameter_even_with_default() {
+        let mut ctx = empty_ctx();
+        ctx.prompt_values.insert("enabled".into(), "false".into());
+        let mut param = p(
+            "--enabled",
+            ParameterKind::Option,
+            ParamSource::Prompt {
+                default_template: Some("true".into()),
+            },
+            false,
+            0,
+        );
+        param.value_type = ValueType::Boolean;
+
+        let argv = build_argv(&[param], &ctx).unwrap();
+        assert!(argv.is_empty());
+    }
+
+    #[test]
+    fn prompt_string_with_boolean_default_omits_parameter_when_unchecked() {
+        // Legacy analyzer versions inferred argparse options with
+        // `default=True/False` as plain strings. The run dialog renders
+        // them as checkboxes, so the backend must apply the same
+        // falsey-omission semantics or the script receives a literal
+        // `--flag false` the UI never promised.
+        let mut ctx = empty_ctx();
+        ctx.prompt_values.insert("enabled".into(), "false".into());
+        let param = p(
+            "--enabled",
+            ParameterKind::Option,
+            ParamSource::Prompt {
+                default_template: Some("true".into()),
+            },
+            false,
+            0,
+        );
+        // value_type stays at the p() default (String) on purpose.
+
+        let argv = build_argv(&[param], &ctx).unwrap();
+        assert!(argv.is_empty());
+    }
+
+    #[test]
+    fn prompt_string_with_argparse_boolean_default_omits_parameter_when_unchecked() {
+        // The settings UI lets users switch a param to Prompt without a
+        // default_template; the argparse default_value is then the only
+        // boolean signal both sides share. The dialog renders a
+        // checkbox (defaultValue = "false"), so the backend must not
+        // emit a literal "--param false".
+        let mut ctx = empty_ctx();
+        ctx.prompt_values.insert("enabled".into(), "false".into());
+        let mut param = p(
+            "--enabled",
+            ParameterKind::Option,
+            ParamSource::Prompt {
+                default_template: None,
+            },
+            false,
+            0,
+        );
+        param.default_value = Some("false".into());
+        // value_type stays String — legacy analyzer output.
+
+        let argv = build_argv(&[param], &ctx).unwrap();
+        assert!(argv.is_empty());
     }
 
     #[test]
