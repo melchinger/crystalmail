@@ -130,7 +130,7 @@ jobs:
       # `prerelease: false` und stabile Tag-Form sind Default; bei
       # Bedarf später per Tag-Suffix `-rc1` markierbar.
       - name: Build Tauri bundle + upload to GitHub Release
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
