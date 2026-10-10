@@ -67,7 +67,7 @@ jobs:
       - name: Install Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
           cache: "npm"
 
       # Universal-macOS braucht beide Rust-Targets installiert; auf
@@ -120,7 +120,7 @@ jobs:
         shell: pwsh
 
       - name: Install Node deps
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       # Der eigentliche Bundle-Build + Release-Upload.
       # `tauri-action` ruft intern `npm run tauri build` und lädt

@@ -662,11 +662,11 @@ export function App() {
   // syncAll is defined below via useCallback and depends on `accounts`; a
   // ref lets the hotkey hook call the current version without forcing a
   // circular dep with the callback.
-  const syncAllRef = useRef<() => Promise<void>>();
+  const syncAllRef = useRef<(() => Promise<void>) | null>(null);
   // Same trick for mark-all-read — the callback depends on the current
   // `inbox` list and that changes often; keeping the hotkey dispatcher
   // stable via this ref avoids re-registering the global keydown.
-  const markAllReadRef = useRef<() => Promise<void>>();
+  const markAllReadRef = useRef<(() => Promise<void>) | null>(null);
 
   /**
    * Folder key that the currently-visible envelope list draws from.

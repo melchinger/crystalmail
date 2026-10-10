@@ -73,7 +73,7 @@ jobs:
       # JS/TS job that doubles as ensuring node_modules is in place for
       # any AST-level inferences the extractor wants to make.
       - uses: actions/setup-node@v4
-        with: { node-version: "20" }
+        with: { node-version: "22" }
 
       - if: matrix.language == 'rust'
         uses: dtolnay/rust-toolchain@stable
@@ -104,7 +104,7 @@ jobs:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
 
-      - run: npm ci
+      - run: npm ci --ignore-scripts
 
       # Frontend build — needed for the Rust job because tauri-build reads
       # dist/. For the JS/TS job it's a no-op for analysis quality but

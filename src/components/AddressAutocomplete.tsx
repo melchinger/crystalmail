@@ -6,7 +6,7 @@ type Props = {
   /** Anchor-Element (das To/Cc/Bcc-Input). Wir messen seine BoundingBox
    *  und positionieren das Dropdown direkt drunter, damit es bei
    *  Resize/Scroll mitwandert ohne Layout-Pflege im Parent. */
-  anchorRef: React.RefObject<HTMLInputElement>;
+  anchorRef: React.RefObject<HTMLInputElement | null>;
   /** Aktueller Wert des Inputs — bei `mode="compose"` suchen wir nach
    *  dem Token rechts vom letzten Komma (Mehrfach-Empfänger-Eingabe wie
    *  "alice@x.de, bob"); bei `mode="single"` ist `value` selbst der
