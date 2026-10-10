@@ -9,8 +9,7 @@ import type { Address } from "../types";
 export function formatMailbox(address: Address): string {
   // Strip CR/LF from the email as well as the display name — a raw
   // newline here would be a header-injection vector into the outgoing
-  // message, and a stray `<`/`>` would corrupt top-level splitting of
-  // the recipient field.
+  // message.
   const email = address.email.replace(/[\r\n]+/g, "").trim();
   if (!address.name) return email;
 
