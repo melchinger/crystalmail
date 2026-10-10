@@ -191,6 +191,14 @@ fn parse_argument_call(
             "Path" | "pathlib.Path" => ValueType::Path,
             _ => infer_value_type(&key, &cli_name),
         }
+    } else if kwargs
+        .get("default")
+        .and_then(|raw| parse_python_bool(raw))
+        .is_some()
+    {
+        // `default=False`/`default=True` is also a common way to
+        // declare a boolean argparse option without `type=bool`.
+        ValueType::Boolean
     } else {
         infer_value_type(&key, &cli_name)
     };
@@ -535,6 +543,24 @@ parser.add_argument("--verbose", action="store_true")
         assert!(matches!(params[1].value_type, ValueType::Number));
         assert!(matches!(params[2].value_type, ValueType::Choice));
         assert!(matches!(params[3].kind, ParameterKind::Flag));
+    }
+
+    #[test]
+    fn infers_boolean_from_boolean_default() {
+        let source = r#"
+parser.add_argument("--enabled", default=False)
+"#;
+        let constants = collect_python_constants(source);
+        let calls = extract_add_argument_calls(source);
+        let params: Vec<ScriptParam> = calls
+            .into_iter()
+            .enumerate()
+            .filter_map(|(order, call)| {
+                parse_argument_call(&call, order as u32, &constants)
+            })
+            .collect();
+        assert_eq!(params.len(), 1);
+        assert!(matches!(params[0].value_type, ValueType::Boolean));
     }
 
     #[test]

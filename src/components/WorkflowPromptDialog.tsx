@@ -23,6 +23,25 @@ import type { EnvelopeSummary, ScriptParam, Workflow } from "../types";
  *  Format-Strings hier müssen 1:1 mit `application/workflows.rs:lookup`
  *  übereinstimmen, sonst sieht der User im Dialog einen anderen Wert
  *  als im finalen Skript-Argument. */
+function isTruthy(value: string): boolean {
+  return ["1", "true", "yes", "on"].includes(value.trim().toLowerCase());
+}
+
+function isBooleanParam(param: ScriptParam): boolean {
+  // `flag` is inherently boolean, and the extra `bool` spelling keeps
+  // imported workflows from older analyzers usable as well.
+  const valueType = String(param.valueType).toLowerCase();
+  const booleanDefault = ["true", "false"].includes(
+    param.defaultValue?.trim().toLowerCase() ?? "",
+  );
+  return (
+    param.kind === "flag" ||
+    valueType === "boolean" ||
+    valueType === "bool" ||
+    (valueType === "string" && booleanDefault)
+  );
+}
+
 function substituteEnvelopeVars(
   s: string | null | undefined,
   envelope: EnvelopeSummary,
@@ -115,9 +134,15 @@ export function WorkflowPromptDialog({
     return init;
   });
 
-  const allRequiredFilled = params.every(
-    (p) => !p.required || (values[p.key] ?? "").trim().length > 0,
-  );
+  const allRequiredFilled = params.every((p) => {
+    if (!p.required) return true;
+    const value = values[p.key] ?? "";
+    // An unchecked boolean is an explicit "do not pass this parameter".
+    // Required booleans still need to be enabled before the workflow can run.
+    return isBooleanParam(p)
+      ? isTruthy(value)
+      : value.trim().length > 0;
+  });
 
   const submit = () => {
     if (!allRequiredFilled) return;
@@ -192,7 +217,22 @@ export function WorkflowPromptDialog({
                     </span>
                   )}
                 </label>
-                {p.valueType === "choice" && p.choices.length > 0 ? (
+                {isBooleanParam(p) ? (
+                  <label className="flex items-center gap-2 text-sm">
+                    <input
+                      type="checkbox"
+                      checked={isTruthy(value)}
+                      onChange={(e) =>
+                        setValues({
+                          ...values,
+                          [p.key]: e.target.checked ? "true" : "false",
+                        })
+                      }
+                      aria-label={p.label}
+                    />
+                    {t("workflows.promptDialog.booleanSet")}
+                  </label>
+                ) : p.valueType === "choice" && p.choices.length > 0 ? (
                   <select
                     value={value}
                     onChange={(e) =>

@@ -1134,6 +1134,7 @@
       "intro": "Dieser Workflow fragt vor dem Lauf nach folgenden Werten:",
       "noPrompts": "Keine Dialog-Eingaben erforderlich.",
       "submitHint": "Strg/⌘ + Enter zum Starten · Esc zum Abbrechen",
+      "booleanSet": "Parameter setzen",
       "cancel": "Abbrechen",
       "run": "Workflow starten"
     }

@@ -34,7 +34,7 @@ use tokio::process::Command;
 
 use crate::domain::message::MessageId;
 use crate::domain::workflow::{
-    BodyFormat, ParamSource, ParameterKind, ScriptParam, Step, Workflow, WorkflowId,
+    BodyFormat, ParamSource, ParameterKind, ScriptParam, Step, ValueType, Workflow, WorkflowId,
 };
 use crate::infrastructure::db::{DbHandle, WriteCmd};
 use crate::infrastructure::queries::{self, EnvelopeDetail};
@@ -1111,6 +1111,20 @@ fn err(idx: u32, kind: &'static str, msg: String) -> StepResult {
     }
 }
 
+fn is_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn is_falsey(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
 /// Build the argv list for a `RunScript` step from its declared
 /// parameters. Mirrors launchpad's `build_command_args`, adapted to
 /// our `ParamSource` enum: `Fixed` takes its value verbatim (after
@@ -1193,17 +1207,31 @@ fn build_argv(params: &[ScriptParam], ctx: &TemplateCtx) -> Result<Vec<String>, 
             }
         };
 
+        // A boolean shown as a Prompt is represented by the run-dialog
+        // checkbox. `false` means "do not pass this parameter", rather
+        // than passing the literal string `false`; this is important for
+        // optional argparse options where presence itself enables a
+        // behaviour. Keep required parameters strict.
+        if p.value_type == ValueType::Boolean
+            && matches!(&p.source, ParamSource::Prompt { .. })
+            && is_falsey(&value)
+        {
+            if p.required {
+                return Err(format!(
+                    "Pflichtparameter '{}' muss gesetzt werden.",
+                    p.label
+                ));
+            }
+            continue;
+        }
+
         match p.kind {
             ParameterKind::Flag => {
                 // Truthy semantics matching launchpad: only emit the
                 // flag when the value evaluates as "yes". This lets
                 // a flag be driven by a template var (e.g. a custom
                 // one that resolves to "true" conditionally).
-                let truthy = matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                );
-                if truthy {
+                if is_truthy(&value) {
                     argv.push(p.cli_name.clone());
                 }
             }
@@ -1645,6 +1673,44 @@ mod tests {
         )];
         let argv = build_argv(&params, &empty_ctx()).unwrap();
         assert_eq!(argv, vec!["--out", "/tmp/x"]);
+    }
+
+    #[test]
+    fn prompt_boolean_checked_passes_parameter() {
+        let mut ctx = empty_ctx();
+        ctx.prompt_values.insert("enabled".into(), "true".into());
+        let mut param = p(
+            "--enabled",
+            ParameterKind::Option,
+            ParamSource::Prompt {
+                default_template: Some("false".into()),
+            },
+            false,
+            0,
+        );
+        param.value_type = ValueType::Boolean;
+
+        let argv = build_argv(&[param], &ctx).unwrap();
+        assert_eq!(argv, vec!["--enabled", "true"]);
+    }
+
+    #[test]
+    fn prompt_boolean_unchecked_omits_parameter_even_with_default() {
+        let mut ctx = empty_ctx();
+        ctx.prompt_values.insert("enabled".into(), "false".into());
+        let mut param = p(
+            "--enabled",
+            ParameterKind::Option,
+            ParamSource::Prompt {
+                default_template: Some("true".into()),
+            },
+            false,
+            0,
+        );
+        param.value_type = ValueType::Boolean;
+
+        let argv = build_argv(&[param], &ctx).unwrap();
+        assert!(argv.is_empty());
     }
 
     #[test]
