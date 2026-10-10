@@ -7,12 +7,17 @@ import type { Address } from "../types";
  * mistaken for a separator when the compose field is turned into a list.
  */
 export function formatMailbox(address: Address): string {
-  if (!address.name) return address.email;
+  // Strip CR/LF from the email as well as the display name — a raw
+  // newline here would be a header-injection vector into the outgoing
+  // message, and a stray `<`/`>` would corrupt top-level splitting of
+  // the recipient field.
+  const email = address.email.replace(/[\r\n]+/g, "").trim();
+  if (!address.name) return email;
 
   const displayName = address.name
     .replace(/[\r\n]+/g, " ")
     .replace(/(["\\])/g, "\\$1");
-  return `"${displayName}" <${address.email}>`;
+  return `"${displayName}" <${email}>`;
 }
 
 /**

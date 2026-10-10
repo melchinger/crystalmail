@@ -30,15 +30,24 @@ function isTruthy(value: string): boolean {
 function isBooleanParam(param: ScriptParam): boolean {
   // `flag` is inherently boolean, and the extra `bool` spelling keeps
   // imported workflows from older analyzers usable as well.
+  //
+  // Must stay in sync with the backend's `is_boolean_prompt` in
+  // application/workflows.rs: a string-typed param is treated as
+  // boolean when EITHER the argparse default (`defaultValue`) OR the
+  // prompt pre-fill (`source.defaultTemplate`) is a literal
+  // true/false — the settings UI lets users switch to prompt source
+  // without carrying the argparse default over.
   const valueType = String(param.valueType).toLowerCase();
-  const booleanDefault = ["true", "false"].includes(
-    param.defaultValue?.trim().toLowerCase() ?? "",
-  );
+  const isBoolLiteral = (v: string | null | undefined) =>
+    ["true", "false"].includes(v?.trim().toLowerCase() ?? "");
+  const promptDefault =
+    param.source.kind === "prompt" ? param.source.defaultTemplate : null;
   return (
     param.kind === "flag" ||
     valueType === "boolean" ||
     valueType === "bool" ||
-    (valueType === "string" && booleanDefault)
+    (valueType === "string" &&
+      (isBoolLiteral(param.defaultValue) || isBoolLiteral(promptDefault)))
   );
 }
 

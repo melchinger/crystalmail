@@ -1213,17 +1213,25 @@ fn build_argv(params: &[ScriptParam], ctx: &TemplateCtx) -> Result<Vec<String>, 
         // optional argparse options where presence itself enables a
         // behaviour. Keep required parameters strict.
         //
-        // Must stay in sync with the dialog's `isBooleanParam()` heuristic
-        // (WorkflowPromptDialog.tsx): a param is treated as boolean either
-        // by declared type or by a literal true/false prompt default —
-        // older analyzers inferred such params as plain strings.
+        // Must stay in sync with the dialog's `isBooleanParam()`
+        // (WorkflowPromptDialog.tsx): a param is boolean either by
+        // declared type, or — for legacy string-typed params — when the
+        // argparse default (`default_value`) or the prompt pre-fill
+        // (`default_template`) is a literal true/false. Both fields are
+        // checked because the settings UI lets users switch a param to
+        // Prompt without carrying over the argparse default.
+        fn is_bool_literal(value: &Option<String>) -> bool {
+            value
+                .as_deref()
+                .map(|d| matches!(d.trim().to_ascii_lowercase().as_str(), "true" | "false"))
+                .unwrap_or(false)
+        }
         let is_boolean_prompt = match &p.source {
             ParamSource::Prompt { default_template } => {
                 p.value_type == ValueType::Boolean
-                    || default_template
-                        .as_deref()
-                        .map(|d| matches!(d.trim().to_ascii_lowercase().as_str(), "true" | "false"))
-                        .unwrap_or(false)
+                    || (p.value_type == ValueType::String
+                        && (is_bool_literal(&p.default_value)
+                            || is_bool_literal(default_template)))
             }
             _ => false,
         };
@@ -1744,6 +1752,31 @@ mod tests {
             0,
         );
         // value_type stays at the p() default (String) on purpose.
+
+        let argv = build_argv(&[param], &ctx).unwrap();
+        assert!(argv.is_empty());
+    }
+
+    #[test]
+    fn prompt_string_with_argparse_boolean_default_omits_parameter_when_unchecked() {
+        // The settings UI lets users switch a param to Prompt without a
+        // default_template; the argparse default_value is then the only
+        // boolean signal both sides share. The dialog renders a
+        // checkbox (defaultValue = "false"), so the backend must not
+        // emit a literal "--param false".
+        let mut ctx = empty_ctx();
+        ctx.prompt_values.insert("enabled".into(), "false".into());
+        let mut param = p(
+            "--enabled",
+            ParameterKind::Option,
+            ParamSource::Prompt {
+                default_template: None,
+            },
+            false,
+            0,
+        );
+        param.default_value = Some("false".into());
+        // value_type stays String — legacy analyzer output.
 
         let argv = build_argv(&[param], &ctx).unwrap();
         assert!(argv.is_empty());
