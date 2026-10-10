@@ -65,7 +65,7 @@ jobs:
             build-mode: none
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Node is needed even for the Rust job — `cargo check` on src-tauri
       # invokes tauri-build, which requires the frontend dist/ to exist.
