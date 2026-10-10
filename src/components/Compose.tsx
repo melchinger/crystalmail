@@ -778,15 +778,8 @@ function LabeledRow({
   );
 }
 
-/** Comma-or-whitespace tolerant split for the To/Cc/Bcc input strings.
- *  Exported so the App-level send pipeline (which wraps Compose's snapshot
- *  in the undo-send buffer) can use the same parsing rules. */
-export function splitAddresses(v: string): string[] {
-  return v
-    .split(",")
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0);
-}
+/** Kept as part of Compose's public API for the App send pipeline. */
+export { splitAddresses } from "../utils/mailAddresses";
 
 function basename(path: string): string {
   const m = path.split(/[\\/]/).filter((p) => p.length > 0);

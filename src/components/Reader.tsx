@@ -31,6 +31,7 @@ import {
   sanitizeFragment,
   stripHtmlToText,
 } from "../utils/mailHtml";
+import { formatMailbox } from "../utils/mailAddresses";
 import type {
   Address,
   AccountSummary,
@@ -2188,11 +2189,9 @@ function buildReplyAllDraft(
 
   const to = [...env.from, ...env.to]
     .filter(notOwn)
-    .map((a) => (a.name ? `${a.name} <${a.email}>` : a.email))
+    .map(formatMailbox)
     .filter(Boolean);
-  const cc = env.cc
-    .filter(notOwn)
-    .map((a) => (a.name ? `${a.name} <${a.email}>` : a.email));
+  const cc = env.cc.filter(notOwn).map(formatMailbox);
 
   const quotedPlain = quoteBodyPlain(detail, env.from[0]);
   const quotedHtml = quoteBodyHtml(detail, env.from[0]);
