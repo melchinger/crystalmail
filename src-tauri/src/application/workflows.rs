@@ -1212,10 +1212,22 @@ fn build_argv(params: &[ScriptParam], ctx: &TemplateCtx) -> Result<Vec<String>, 
         // than passing the literal string `false`; this is important for
         // optional argparse options where presence itself enables a
         // behaviour. Keep required parameters strict.
-        if p.value_type == ValueType::Boolean
-            && matches!(&p.source, ParamSource::Prompt { .. })
-            && is_falsey(&value)
-        {
+        //
+        // Must stay in sync with the dialog's `isBooleanParam()` heuristic
+        // (WorkflowPromptDialog.tsx): a param is treated as boolean either
+        // by declared type or by a literal true/false prompt default —
+        // older analyzers inferred such params as plain strings.
+        let is_boolean_prompt = match &p.source {
+            ParamSource::Prompt { default_template } => {
+                p.value_type == ValueType::Boolean
+                    || default_template
+                        .as_deref()
+                        .map(|d| matches!(d.trim().to_ascii_lowercase().as_str(), "true" | "false"))
+                        .unwrap_or(false)
+            }
+            _ => false,
+        };
+        if is_boolean_prompt && is_falsey(&value) {
             if p.required {
                 return Err(format!(
                     "Pflichtparameter '{}' muss gesetzt werden.",
@@ -1708,6 +1720,30 @@ mod tests {
             0,
         );
         param.value_type = ValueType::Boolean;
+
+        let argv = build_argv(&[param], &ctx).unwrap();
+        assert!(argv.is_empty());
+    }
+
+    #[test]
+    fn prompt_string_with_boolean_default_omits_parameter_when_unchecked() {
+        // Legacy analyzer versions inferred argparse options with
+        // `default=True/False` as plain strings. The run dialog renders
+        // them as checkboxes, so the backend must apply the same
+        // falsey-omission semantics or the script receives a literal
+        // `--flag false` the UI never promised.
+        let mut ctx = empty_ctx();
+        ctx.prompt_values.insert("enabled".into(), "false".into());
+        let param = p(
+            "--enabled",
+            ParameterKind::Option,
+            ParamSource::Prompt {
+                default_template: Some("true".into()),
+            },
+            false,
+            0,
+        );
+        // value_type stays at the p() default (String) on purpose.
 
         let argv = build_argv(&[param], &ctx).unwrap();
         assert!(argv.is_empty());
