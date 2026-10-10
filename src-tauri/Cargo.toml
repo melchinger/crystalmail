@@ -108,7 +108,7 @@ tauri-plugin-shell = "2.3.5"
 # the JSON backup file.
 argon2 = "0.5"
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc", "getrandom"] }
-base64 = "0.22"
+base64 = "0.23"
 getrandom = "0.2"
 
 # ── Contacts I/O: CSV-Roundtrip (vCard wird hand-gerollt) ─────────────────────
