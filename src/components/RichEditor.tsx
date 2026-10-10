@@ -248,7 +248,7 @@ function Toolbar({
   editorRef,
   onChange,
 }: {
-  editorRef: React.RefObject<HTMLDivElement>;
+  editorRef: React.RefObject<HTMLDivElement | null>;
   onChange?: () => void;
 }) {
   const cmd = (command: string, value?: string) => {

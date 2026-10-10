@@ -62,7 +62,7 @@ die AppImage — ohne Aufwand.
 
 ### Requirements
 
-- Node.js 20+
+- Node.js 22.12+
 - Rust stable (via [rustup](https://rustup.rs))
 - Tauri v2 platform prerequisites ([Windows](https://v2.tauri.app/start/prerequisites/#windows) / macOS / Linux)
 - A local `pi` binary on `PATH` (configurable later via Settings)
