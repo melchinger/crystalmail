@@ -99,7 +99,7 @@ jobs:
       # CodeQL init must run BEFORE the build so it can wrap rustc and
       # intercept every compilation unit. Skipping this ordering is the
       # #1 cause of "low analysis quality" warnings on Rust projects.
-      - uses: github/codeql-action/init@v3
+      - uses: github/codeql-action/init@v4
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
@@ -118,6 +118,6 @@ jobs:
       # + npm build above are still required because the extractor's
       # internal cargo invocation inherits this environment.
 
-      - uses: github/codeql-action/analyze@v3
+      - uses: github/codeql-action/analyze@v4
         with:
           category: "/language:${{ matrix.language }}"
