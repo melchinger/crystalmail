@@ -1479,6 +1479,14 @@ export function App() {
         | null
         | undefined;
       if (!data || data.type !== "cm:open-url" || !data.href) return;
+      // Sandboxed blob iframes have an opaque `null` origin. Reject
+      // messages from unrelated web pages before inspecting the URL.
+      if (
+        !e.source ||
+        (e.origin !== "null" && e.origin !== window.location.origin)
+      ) {
+        return;
+      }
       // Allow http/https/mailto only — matches the capability
       // whitelist in tauri.conf. Anything else is silently dropped.
       if (!/^(https?:|mailto:)/i.test(data.href)) {
