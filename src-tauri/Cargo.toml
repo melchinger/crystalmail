@@ -60,7 +60,7 @@ ical = { version = "0.10", default-features = false, features = ["ical"] }
 # weekly events that cross a DST boundary keep firing at the right wall
 # clock time. We use it strictly on the import path; outgoing CrystalMail
 # events stay non-recurring (RRULE round-trip is out of scope).
-rrule = "0.13"
+rrule = "0.14"
 # HTTP client for read-only iCal/webcal calendar subscriptions. We use
 # rustls (matches the rest of the TLS stack — no native-tls / OpenSSL
 # duplication) and explicitly disable cookie/proxy/charset goop we don't
