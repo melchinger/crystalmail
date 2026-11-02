@@ -54,7 +54,7 @@ mail-parser = "0.9"
 # RFC 5545 parser. We use it only to read invitations from incoming mail
 # attachments — outgoing REPLY ICS is hand-built (small, well-defined shape,
 # avoids depending on the crate's writer surface).
-ical = { version = "0.10", default-features = false, features = ["ical"] }
+ical = { version = "0.11", default-features = false, features = ["ical"] }
 # RFC 5545 RRULE expander for recurring imported events (Phase 3+). Pulls
 # in chrono-tz transitively for IANA-aware time arithmetic — needed so
 # weekly events that cross a DST boundary keep firing at the right wall
