@@ -1099,6 +1099,10 @@ export type ComposeDraft = {
    *  cancelled send re-opens with byte-identical body, signature, and
    *  attachments — no reformatting surprises. */
   bodyHtml?: string;
+  /** Stable token for the server-side auto-saved draft of this compose
+   *  session. It lets the send path remove that draft after a successful
+   *  send, even before the draft has been indexed locally. */
+  draftId?: string;
   /** Pre-seeded HTML block appended after the user's own body when sending.
    *  Set by reply/forward builders with the quoted original; the user never
    *  sees or edits this — they only edit the plain body above. */

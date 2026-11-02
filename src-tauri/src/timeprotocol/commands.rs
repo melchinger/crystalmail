@@ -1487,6 +1487,7 @@ pub async fn tp_send_initial_request(
         body_html: None,
         in_reply_to: None,
         references: vec![],
+        draft_id: None,
         attachments: vec![smtp::AttachmentSpec {
             path: attachment_path.to_string_lossy().into_owned(),
             filename: Some("envelope-request.json".into()),
@@ -1741,6 +1742,7 @@ async fn send_outbound_envelope(
         body_html: None,
         in_reply_to: None,
         references: vec![],
+        draft_id: None,
         attachments: vec![smtp::AttachmentSpec {
             path: attachment_path.to_string_lossy().into_owned(),
             filename: Some(format!(

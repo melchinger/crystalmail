@@ -44,25 +44,49 @@ export function sanitizeFragment(fragment: string): string {
     return "";
   }
 
-  doc
-    .querySelectorAll("script, iframe, object, embed, meta, link, base")
-    .forEach((n) => n.remove());
+  removeUnsafeContent(doc);
+  return doc.body?.innerHTML ?? "";
+}
 
-  doc.querySelectorAll("*").forEach((el) => {
-    [...el.attributes].forEach((attr) => {
-      const name = attr.name.toLowerCase();
-      const value = attr.value;
-      if (name.startsWith("on")) el.removeAttribute(attr.name);
+/**
+ * Prepare sender HTML for the isolated reader preview. Unlike body-only
+ * extraction, this retains author CSS from the document head while still
+ * returning a fragment, so it cannot create nested html/head/body documents.
+ * The returned style elements are real markup (not escaped text).
+ */
+export function prepareMailHtmlForPreview(raw: string): string {
+  if (!raw) return "";
+  let doc: Document;
+  try {
+    doc = new DOMParser().parseFromString(raw, "text/html");
+  } catch {
+    return sanitizeFragment(extractHtmlBody(raw));
+  }
+
+  removeUnsafeContent(doc);
+  const headStyles = [...doc.head.querySelectorAll("style")]
+    .map((style) => style.outerHTML)
+    .join("");
+  return headStyles + (doc.body?.innerHTML ?? "");
+}
+
+function removeUnsafeContent(root: ParentNode): void {
+  root
+    .querySelectorAll("script, iframe, object, embed, meta, link, base")
+    .forEach((node) => node.remove());
+
+  root.querySelectorAll("*").forEach((element) => {
+    [...element.attributes].forEach((attribute) => {
+      const name = attribute.name.toLowerCase();
+      if (name.startsWith("on")) element.removeAttribute(attribute.name);
       if (
         (name === "href" || name === "src" || name === "xlink:href") &&
-        /^\s*javascript:/i.test(value)
+        /^\s*javascript:/i.test(attribute.value)
       ) {
-        el.removeAttribute(attr.name);
+        element.removeAttribute(attribute.name);
       }
     });
   });
-
-  return doc.body?.innerHTML ?? "";
 }
 
 /**

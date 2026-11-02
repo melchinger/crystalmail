@@ -10,8 +10,12 @@
 // with a TLS-negotiation symptom we automatically retry using the other
 // variant and tell the caller which one worked.
 
+use futures_util::StreamExt;
 use lettre::{
-    message::{header::ContentType, Attachment, Body, Mailbox, Message, MessageBuilder, MultiPart, SinglePart},
+    message::{
+        header::{ContentType, HeaderName, HeaderValue},
+        Attachment, Body, Mailbox, Message, MessageBuilder, MultiPart, SinglePart,
+    },
     transport::smtp::authentication::Credentials,
     AsyncSmtpTransport, AsyncTransport, Tokio1Executor,
 };
@@ -31,7 +35,7 @@ pub struct FromIdentity {
     pub from_name: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SendMailRequest {
     pub account_id: AccountId,
@@ -58,6 +62,10 @@ pub struct SendMailRequest {
     pub in_reply_to: Option<String>,
     #[serde(default)]
     pub references: Vec<String>,
+    /// Internal token added only to server-side auto-saved drafts. A
+    /// successful send uses it to remove the corresponding draft again.
+    #[serde(default)]
+    pub draft_id: Option<String>,
     /// Absolute paths to files that should be attached. Reads happen on the
     /// (blocking) thread lettre's builder runs on; we don't bother streaming
     /// because MTA submission rewrites the whole message anyway.
@@ -247,6 +255,15 @@ pub async fn send(db: &DbHandle, req: SendMailRequest) -> Result<(), String> {
         }
     }
 
+    // A two-minute auto-save may have left a server-side draft behind.
+    // Cleanup is deliberately best-effort: the message was already sent,
+    // so a cleanup failure must not turn a successful send into an error.
+    if let Some(draft_id) = req.draft_id.as_deref() {
+        if let Err(e) = delete_draft_by_token(&account, &password, draft_id, false).await {
+            tracing::warn!(error = %e, "auto-saved draft cleanup after send failed");
+        }
+    }
+
     // Compose-Send-Side-Effect: typed-in Empfänger sofort in die
     // address_history pushen damit das Autocomplete sie kennt, ohne
     // auf den nächsten IMAP-Sync der Sent-Mail warten zu müssen.
@@ -387,6 +404,96 @@ async fn append_to_folder(
     res
 }
 
+fn is_valid_draft_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Remove all server-side drafts belonging to one compose session. The
+/// marker is only written to drafts and is never included in the sent mail.
+async fn delete_draft_by_token(
+    account: &AccountSummary,
+    password: &str,
+    draft_id: &str,
+    keep_latest: bool,
+) -> Result<(), String> {
+    if !is_valid_draft_id(draft_id) {
+        return Err("Ungültige Draft-ID.".to_string());
+    }
+    if account.drafts_folder.trim().is_empty() {
+        return Ok(());
+    }
+    let client = imap_client::connect_tls(&account.imap_host, account.imap_port)
+        .await
+        .map_err(|e| format!("IMAP connect {}: {e}", account.imap_host))?;
+    let mut session = client
+        .login(&account.address, password)
+        .await
+        .map_err(|(e, _)| format!("IMAP LOGIN: {e}"))?;
+    session
+        .select(&account.drafts_folder)
+        .await
+        .map_err(|e| format!("SELECT {}: {e}", account.drafts_folder))?;
+
+    let uids = session
+        .uid_search(format!("HEADER X-CrystalMail-Draft-ID {draft_id}"))
+        .await
+        .map_err(|e| format!("Draft-Suche: {e}"))?;
+    if uids.is_empty() {
+        let _ = session.logout().await;
+        return Ok(());
+    }
+
+    // A manual save or a send-failure recovery can append a newer version
+    // with the same token. Keep the newest UID during replacement; on send
+    // cleanup all matching drafts because none should remain.
+    let keep_uid = if keep_latest {
+        uids.iter().max().copied()
+    } else {
+        None
+    };
+    let uids_to_delete = uids
+        .iter()
+        .filter(|uid| Some(**uid) != keep_uid)
+        .collect::<Vec<_>>();
+    if uids_to_delete.is_empty() {
+        let _ = session.logout().await;
+        return Ok(());
+    }
+    let uid_set = uids_to_delete
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    {
+        let mut store = session
+            .uid_store(&uid_set, "+FLAGS.SILENT (\\Deleted)")
+            .await
+            .map_err(|e| format!("Draft löschen: {e}"))?;
+        while let Some(result) = store.next().await {
+            result.map_err(|e| format!("Draft löschen: {e}"))?;
+        }
+    }
+
+    // UID EXPUNGE avoids deleting unrelated messages that another client
+    // may have marked as deleted in the Drafts folder.
+    {
+        let expunge = session
+            .uid_expunge(&uid_set)
+            .await
+            .map_err(|e| format!("Draft EXPUNGE: {e}"))?;
+        tokio::pin!(expunge);
+        while let Some(result) = expunge.next().await {
+            result.map_err(|e| format!("Draft EXPUNGE: {e}"))?;
+        }
+    }
+    let _ = session.logout().await;
+    Ok(())
+}
+
 /// Speichert die zusammengesetzte Mail als Entwurf im Drafts-Ordner des
 /// Accounts (IMAP APPEND mit Flags `\Draft \Seen`). Anders als beim Senden
 /// gibt es hier keine Validate-Phase für Empfänger — Drafts dürfen unfertig
@@ -427,7 +534,16 @@ pub async fn save_as_draft(db: &DbHandle, req: SendMailRequest) -> Result<(), St
         "(\\Draft \\Seen)",
         &rfc822,
     )
-    .await
+    .await?;
+
+    // Replace an earlier auto-save/manual-save version only after the new
+    // APPEND succeeded, so a failed save never destroys the last good copy.
+    if let Some(draft_id) = req.draft_id.as_deref() {
+        if let Err(e) = delete_draft_by_token(&account, &password, draft_id, true).await {
+            tracing::warn!(error = %e, "older auto-saved draft cleanup failed");
+        }
+    }
+    Ok(())
 }
 
 /// Schickt eine selbst-adressierte Test-Mail mit eindeutiger Message-Id,
@@ -645,7 +761,11 @@ async fn try_send(
     req: &SendMailRequest,
     use_implicit_tls: bool,
 ) -> Result<Vec<u8>, String> {
-    let message = build_message(account, req)?;
+    // The draft token is metadata for the server-side draft only. Never put
+    // it into the actual outgoing mail or the Sent copy.
+    let mut smtp_req = req.clone();
+    smtp_req.draft_id = None;
+    let message = build_message(account, &smtp_req)?;
     let rfc822 = message.formatted();
 
     let creds = Credentials::new(account.address.clone(), password.to_string());
@@ -682,6 +802,16 @@ fn build_message(account: &AccountSummary, req: &SendMailRequest) -> Result<Mess
     let mut builder: MessageBuilder = Message::builder()
         .from(from_mailbox)
         .subject(&req.subject);
+
+    if let Some(draft_id) = req.draft_id.as_deref() {
+        if !is_valid_draft_id(draft_id) {
+            return Err("Ungültige Draft-ID.".to_string());
+        }
+        builder = builder.raw_header(HeaderValue::new(
+            HeaderName::new_from_ascii_str("X-CrystalMail-Draft-ID"),
+            draft_id.to_string(),
+        ));
+    }
 
     for addr in &req.to {
         let mb: Mailbox = addr

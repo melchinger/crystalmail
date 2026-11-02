@@ -1036,6 +1036,7 @@ export function App() {
         bodyHtml,
         inReplyTo: snap.inReplyToHeader,
         references: snap.references ?? [],
+        draftId: snap.draftId,
         attachments: snap.attachments.map((a) => ({
           path: a.path,
           filename: a.filename,
@@ -1063,6 +1064,7 @@ export function App() {
       subject: snap.subject,
       body: snap.body,
       bodyHtml: snap.bodyHtml,
+      draftId: snap.draftId,
       attachments: snap.attachments,
       inReplyToHeader: snap.inReplyToHeader,
       references: snap.references,
@@ -1123,6 +1125,32 @@ export function App() {
       }
     },
     [t, buildSendRequest, reopenAsDraft],
+  );
+
+  /** Persist the compose contents after two minutes without closing the
+   *  composer. The draft token is carried through to send_mail so the
+   *  server can remove this draft after a successful send. */
+  const performAutoSaveDraft = useCallback(
+    async (snap: ComposeSendSnapshot) => {
+      try {
+        await invoke("save_draft", { request: buildSendRequest(snap) });
+        setStatus(t("compose.draftSaved"));
+        if (snap.replacesDraftMessageId) {
+          void invoke("delete_message", {
+            messageId: snap.replacesDraftMessageId,
+          }).catch((err) =>
+            console.warn("draft cleanup after auto-save failed:", err),
+          );
+        }
+        if (activeFolder === "drafts") {
+          void refreshRef.current?.();
+        }
+      } catch (e) {
+        console.error("automatic save_draft failed:", e);
+        setStatus(t("compose.draftSaveFailed", { detail: String(e) }));
+      }
+    },
+    [t, activeFolder, buildSendRequest],
   );
 
   /** Explicit "Save as Draft" button in Compose. Optimistic close (the
@@ -2426,12 +2454,8 @@ export function App() {
             // schmeißen, das Overlay zählt 5s runter.
             enqueueSend(snap);
           }}
-          onSaveDraft={(snap) => {
-            // Optimistic: Compose-Dialog ist schon zu, der eigentliche
-            // IMAP-APPEND läuft im Hintergrund. Status / Fehler kommen
-            // als Toast, nicht modal.
-            void performSaveDraft(snap);
-          }}
+          onAutoSave={(snap) => performAutoSaveDraft(snap)}
+          onSaveDraft={(snap) => performSaveDraft(snap)}
         />
       )}
 
