@@ -106,7 +106,7 @@ tauri-plugin-shell = "2.3.5"
 # rustls-only TLS stack and they cross-compile cleanly. `getrandom` provides
 # the OS RNG for nonces and KDF salts. base64 carries the encoded blobs in
 # the JSON backup file.
-argon2 = "0.5"
+argon2 = "0.6"
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc", "getrandom"] }
 base64 = "0.22"
 getrandom = "0.2"
