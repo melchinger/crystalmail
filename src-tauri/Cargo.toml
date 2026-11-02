@@ -48,7 +48,7 @@ lettre = { version = "0.11", default-features = false, features = [
   "builder",
   "hostname",
 ] }
-mail-parser = "0.9"
+mail-parser = "0.11"
 
 # ── iCalendar parsing for invitation handling (Phase 0 calendar) ──────────────
 # RFC 5545 parser. We use it only to read invitations from incoming mail
