@@ -28,6 +28,7 @@ import {
   escapeHtml,
   extractHtmlBody,
   plainToHtml,
+  prepareMailHtmlForPreview,
   sanitizeFragment,
   stripHtmlToText,
 } from "../utils/mailHtml";
@@ -46,6 +47,14 @@ import type {
   MessageDetail,
   WorkflowRunResult,
 } from "../types";
+
+// Keep the mail click bridge in the application bundle instead of embedding
+// it inline in the blob document. Tauri's production CSP intentionally blocks
+// inline scripts in that document.
+const MAIL_LINK_INTERCEPTOR_URL = new URL(
+  "/mail-link-interceptor.js",
+  window.location.origin,
+).href;
 
 /** Lokales Lade-Modell für den Header-Person-Icon-Status. Mehr States
  *  als das Backend-Pendant, weil wir hier auch "noch nicht gefragt"
@@ -1772,22 +1781,29 @@ function BodyView({
   const srcDoc = useMemo(() => {
     if (html) {
       const resolved = resolveCidImages(html, cidMap);
-      return buildSandboxDoc(resolved, false, allowRemote);
+      return buildSandboxDoc(
+        resolved,
+        false,
+        allowRemote,
+        MAIL_LINK_INTERCEPTOR_URL,
+      );
     }
-    if (plain) return buildSandboxDoc(escapeHtml(plain), true, false);
+    if (plain) {
+      return buildSandboxDoc(
+        escapeHtml(plain),
+        true,
+        false,
+        MAIL_LINK_INTERCEPTOR_URL,
+      );
+    }
     return null;
   }, [plain, html, cidMap, allowRemote]);
 
-  // Statt `srcdoc` setzen wir den iframe per `src=blob:`. Hintergrund:
-  // srcdoc erbt die Parent-CSP — und Tauri 2 injiziert dort einen
-  // `nonce-…`. Per CSP3-Spec deaktiviert ein Nonce alle `'unsafe-inline'`
-  // im selben `script-src`/`style-src`. Folge: das Click-Interceptor-
-  // Skript im iframe-Body läuft nie, der Klick auf Links navigiert die
-  // iframe extern und WebView2 zeigt die "Inhalt blockiert"-Seite. Ein
-  // blob-URL-iframe ist dagegen ein eigenständiges Dokument; die im
-  // HTML eingebettete Meta-CSP gilt allein, der Parent-Nonce ist nicht
-  // mehr im Spiel. `frame-src blob:` wurde in der Tauri-CSP entsprechend
-  // erweitert.
+  // Statt `srcdoc` setzen wir den iframe per `src=blob:`. So bekommt der
+  // Mail-Inhalt ein eigenes Dokument mit eigener CSP. Der Link-Interceptor
+  // wird darin als externes App-Skript geladen: Tauri darf Inline-Skripte
+  // per Nonce/Hash blockieren, ohne dadurch Mail-Links funktionslos zu
+  // machen. `frame-src blob:` ist dafür in der Tauri-CSP freigegeben.
   const blobUrl = useMemo(() => {
     if (!srcDoc) return null;
     const blob = new Blob([srcDoc], { type: "text/html;charset=utf-8" });
@@ -1984,15 +2000,14 @@ function buildSandboxDoc(
   innerHtml: string,
   preformatted: boolean,
   allowRemoteImages: boolean,
+  linkInterceptorUrl: string,
 ): string {
-  // Mail-HTML kommt oft als komplettes Dokument (`<html><body style="…">…`).
-  // Wenn wir das 1:1 in unseren Sandbox-Body kippen, klemmt's: Browser
-  // folden zwar nested `<html>`/`<body>` weg, aber inline `style="color:
-  // #1f2937"` vom Sender-Body wird bei vielen Engines auf einen
-  // automatisch erzeugten Wrapper-Knoten umgeschrieben → near-black-on-
-  // near-black im Dark-Mode. Vor dem Wrap also den Body extrahieren,
-  // sodass nur der eigentliche Inhalt unter UNSEREM Body landet.
-  const cleaned = preformatted ? innerHtml : extractHtmlBody(innerHtml);
+  // Mail-HTML kommt oft als komplettes Dokument (`<html><head>…</head><body>…`).
+  // Keep sender styles from its head, but return only a sanitized fragment so
+  // nested documents and executable sender content cannot enter the sandbox.
+  const cleaned = preformatted
+    ? innerHtml
+    : prepareMailHtmlForPreview(innerHtml);
   const body = preformatted
     ? `<pre style="white-space: pre-wrap; word-wrap: break-word; font-family: inherit; margin: 0;">${innerHtml}</pre>`
     : cleaned;
@@ -2017,15 +2032,18 @@ function buildSandboxDoc(
   //   are user-gated to defeat tracking pixels.
   // - `style-src 'unsafe-inline'` — needed for the inline `<style>` block
   //   we ship with the iframe AND for sender's inline `style="…"` attrs.
-  // - `script-src 'unsafe-inline'` — only the hard-coded link-interceptor
-  //   below runs; the sanitizer strips sender `<script>` tags.
+  // - `script-src` allows only the bundled link-interceptor below;
+  //   sender inline and external scripts stay blocked. The explicit app
+  //   origin is needed because sandboxing makes the iframe's origin opaque,
+  //   so `'self'` alone would not match the external application asset.
   // - `font-src data:` — data-URL embedded fonts are allowed; remote
   //   fonts are blocked (another tracking vector).
   // ──────────────────────────────────────────────────────────────────────
   const imgSrc = allowRemoteImages
     ? "data: https: http:"
     : "data:";
-  const csp = `default-src 'none'; img-src ${imgSrc}; style-src 'unsafe-inline'; script-src 'unsafe-inline'; font-src data:;`;
+  const appOrigin = new URL(linkInterceptorUrl).origin;
+  const csp = `default-src 'none'; img-src ${imgSrc}; style-src 'unsafe-inline'; script-src 'self' ${appOrigin}; font-src data:;`;
   // Dark-Mode-Politik fuer die iframe-Buehne:
   //   * Plain-Text-Mails: respect prefers-color-scheme. Keine Autoren-CSS
   //     im Spiel, also schalten wir Body-Farben mit der OS-Praeferenz um.
@@ -2081,56 +2099,7 @@ function buildSandboxDoc(
     </style>
   </head>
   <body>${body}
-<script>
-  // Intercept clicks on any anchor with an http/https/mailto href and
-  // forward the URL to the parent window via postMessage. The parent
-  // hands it to Tauri's shell plugin which opens the OS-default browser
-  // (not another Tauri window). Runs inside the "allow-scripts"-only
-  // sandbox so it has no access to parent DOM, cookies, or storage.
-  //
-  // Defensive: damit's auch dann funktioniert, wenn das anchor-Element
-  // ein target=_blank oder eine Inline-Onclick-Logik traegt (Marketing-
-  // Mailer mit Tracking-Wrappern), preventDefault'en wir VOR jeder
-  // weiteren Logik. preventDefault-stopPropagation-stopImmediate sicher
-  // belegt, falls das Anchor-Element selbst einen Listener mit
-  // capture=false traegt.
-  console.log('[crystalmail-iframe] link-interceptor installed');
-  document.addEventListener('click', function(e) {
-    var el = e.target;
-    while (el && el.nodeName !== 'A') el = el.parentNode;
-    if (!el || !el.href) return;
-    var href = el.getAttribute('href') || '';
-    if (!/^(https?:|mailto:)/i.test(href)) {
-      console.log('[crystalmail-iframe] click on non-http href — ignoring:', href);
-      return;
-    }
-    e.preventDefault();
-    e.stopPropagation();
-    if (typeof e.stopImmediatePropagation === 'function') {
-      e.stopImmediatePropagation();
-    }
-    console.log('[crystalmail-iframe] forwarding click to parent:', el.href);
-    try {
-      window.parent.postMessage(
-        { type: 'cm:open-url', href: el.href },
-        '*'
-      );
-    } catch (err) {
-      console.error('[crystalmail-iframe] postMessage failed:', err);
-    }
-  }, true);
-  // Zusaetzliche Schutzschicht: einige Mail-Engines geben Anchors einen
-  // submit-handler oder fuegen form-Wrapper drumrum. Wir blocken
-  // beide Defaults global, damit der iframe niemals nach extern
-  // navigiert. Visuelles Symptom des Fehlers war exakt das: WebView2
-  // versuchte die externe URL im iframe zu laden und die Block-
-  // Seite (X-Frame-Options / SmartScreen / corp policy) erschien.
-  window.addEventListener('beforeunload', function(e) {
-    console.warn('[crystalmail-iframe] beforeunload — blocking iframe navigation');
-    e.preventDefault();
-    e.returnValue = '';
-  });
-</script>
+<script src="${escapeHtml(linkInterceptorUrl)}"></script>
 </body>
 </html>`;
 }

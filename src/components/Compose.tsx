@@ -15,6 +15,10 @@ import type {
   ComposeDraft,
 } from "../types";
 
+const AUTO_SAVE_DELAY_MS = 2 * 60 * 1000;
+
+type SnapshotBuilder = () => ComposeSendSnapshot | null;
+
 /** Snapshot of the composed mail handed to the caller. The undo-send
  *  pipeline ships this through a 5-second buffer; on cancel, Compose re-
  *  opens with these fields plus `bodyHtml` so the editor restores byte-
@@ -36,6 +40,9 @@ export type ComposeSendSnapshot = {
   references?: string[];
   parentMessageId?: string;
   parentMode?: "answered" | "forwarded";
+  /** Stable token for the server-side auto-saved draft of this compose
+   *  session. The send path removes matching drafts after a successful send. */
+  draftId?: string;
   /** Wenn gesetzt, ist das ein Edit eines bestehenden Server-Drafts.
    *  Caller löscht nach erfolgreichem Send/Save-Draft die Original-
    *  Mail (Best-Effort), damit nicht zwei Versionen rumliegen. */
@@ -50,9 +57,10 @@ type Props = {
    *  invocation — typically wraps it in a 5-second undo buffer. */
   onSendRequest: (snapshot: ComposeSendSnapshot) => void;
   /** Called when the user clicks "Save as Draft". The parent fires the
-   *  `save_draft` Tauri command. Compose itself doesn't await — closes
-   *  immediately, parent surfaces success/failure as a status message. */
-  onSaveDraft: (snapshot: ComposeSendSnapshot) => void;
+   *  `save_draft` Tauri command and closes after it completes. */
+  onSaveDraft: (snapshot: ComposeSendSnapshot) => Promise<void>;
+  /** Persists the current snapshot without closing the composer. */
+  onAutoSave: (snapshot: ComposeSendSnapshot) => Promise<void>;
 };
 
 type Mode = "new" | "reply" | "forward";
@@ -63,6 +71,7 @@ export function Compose({
   onClose,
   onSendRequest,
   onSaveDraft,
+  onAutoSave,
 }: Props) {
   const { t } = useTranslation();
 
@@ -132,6 +141,11 @@ export function Compose({
   const bccRef = useRef<HTMLInputElement>(null);
   const subjectRef = useRef<HTMLInputElement>(null);
   const formRef = useRef<HTMLFormElement>(null);
+  // One stable token identifies every server-side draft created during this
+  // compose session. The successful send path uses it to clean up the draft.
+  const draftIdRef = useRef(draft.draftId ?? crypto.randomUUID());
+  const autoSaveInFlightRef = useRef<Promise<void> | null>(null);
+  const snapshotBuilderRef = useRef<SnapshotBuilder | null>(null);
   // Build the editor's initial HTML.
   //
   //   * Undo-send-roundtrip path: caller pre-built the body HTML and
@@ -345,12 +359,48 @@ export function Compose({
       references: draft.references,
       parentMessageId: draft.parentMessageId,
       parentMode: draft.parentMode,
+      draftId: draftIdRef.current,
       replacesDraftMessageId: draft.replacesDraftMessageId,
     };
   };
 
-  const submit = (e: React.FormEvent) => {
+  // Keep the latest stateful snapshot builder available to the one-shot timer
+  // without restarting the two-minute countdown on every keystroke.
+  snapshotBuilderRef.current = buildSnapshot;
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      const snap = snapshotBuilderRef.current?.();
+      if (!snap) return;
+      const save = onAutoSave(snap);
+      autoSaveInFlightRef.current = save;
+      void save.then(
+        () => {
+          if (autoSaveInFlightRef.current === save) {
+            autoSaveInFlightRef.current = null;
+          }
+        },
+        () => {
+          if (autoSaveInFlightRef.current === save) {
+            autoSaveInFlightRef.current = null;
+          }
+        },
+      );
+    }, AUTO_SAVE_DELAY_MS);
+    return () => window.clearTimeout(timer);
+  }, [onAutoSave]);
+
+  const waitForAutoSave = async () => {
+    const save = autoSaveInFlightRef.current;
+    if (save) await save;
+  };
+
+  const submit = async (e: React.FormEvent) => {
     e.preventDefault();
+    // If the two-minute save and Send happen at the same time, finish the
+    // save first. Otherwise the draft could be appended after the send and
+    // would survive the cleanup in the send path.
+    await waitForAutoSave();
     const snap = buildSnapshot();
     if (!snap) return;
     setError(null);
@@ -361,11 +411,15 @@ export function Compose({
     onClose();
   };
 
-  const onSaveDraftClick = () => {
+  const onSaveDraftClick = async () => {
+    await waitForAutoSave();
     const snap = buildSnapshot();
     if (!snap) return;
     setError(null);
-    onSaveDraft(snap);
+    // Close optimistically. The parent reopens the snapshot if the server
+    // rejects the save, so awaiting here would close that recovery dialog
+    // again.
+    void onSaveDraft(snap);
     onClose();
   };
 
@@ -373,9 +427,6 @@ export function Compose({
     <div
       className="fixed inset-0 z-50 flex items-center justify-center px-4"
       style={{ background: "rgba(0,0,0,0.45)" }}
-      onMouseDown={(e) => {
-        if (e.target === e.currentTarget) onClose();
-      }}
     >
       <form
         ref={formRef}
